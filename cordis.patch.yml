@@ -1,0 +1,6 @@
+# dsh-agent-context bundle patch: mounts the /context command and the
+# ctx.contextMeter service. Read-only consumer of the official token-meter
+# and session-projection services (both already composed in web-app).
+- insert:
+    - id: agent-context
+      name: dsh-agent-context
