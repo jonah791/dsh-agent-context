@@ -12,8 +12,10 @@
  */
 import { Context, Service } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
+import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import type { Session } from '@deepseek-ai/dsh-session';
 import type { CommandInvocation } from '@deepseek-ai/dsh-commands';
+import type { Agent } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-session-projection';
 import type {
   ContextBreakdownProjection,
@@ -27,9 +29,16 @@ import { formatReportText } from './format.js';
 export const name = 'agent-context';
 export const inject = ['commands', 'tokenMeter', 'sessionProjections'];
 
-/** 零配置：感知是只读的，没有可调参数。 */
-export interface Config {}
-export const Config = z.object({});
+export interface Config {
+  /** 上下文占用达到该阈值（tokens）时自动插话提醒（0 = 关闭）。 */
+  warnThreshold: number
+  /** 同一会话两次提醒的最小间隔（ms），防刷屏。 */
+  warnCooldownMs: number
+}
+export const Config = z.object({
+  warnThreshold: z.number().default(500000),
+  warnCooldownMs: z.number().default(3600000),
+});
 
 /** 一次感知快照：上下文占用 + 已花费 token + 组成。 */
 export interface ContextReport {
@@ -123,6 +132,36 @@ declare module '@deepseek-ai/cordis' {
 /** 注册 /context 命令并挂载 contextMeter 服务。 */
 export function apply(ctx: Context, config: Config): void {
   ctx.plugin(ContextMeter, config);
+  if (config.warnThreshold > 0) {
+    const warnedAt = new Map<string, number>();
+    ctx.on('agent/status', ({ agent, status }: { agent: Agent; status: string }) => {
+      if (status !== 'idle') return;
+      try {
+        const report = buildReport(ctx.tokenMeter, ctx.sessionProjections, agent.session);
+        const tokens = report.projectedTokens ?? report.totalTokens;
+        if (tokens >= config.warnThreshold) {
+          const last = warnedAt.get(agent.id) ?? 0;
+          const now = Date.now();
+          if (now - last >= config.warnCooldownMs) {
+            warnedAt.set(agent.id, now);
+            const text = '【上下文提醒】当前上下文约 '
+              + (tokens / 1000).toFixed(0) + 'k tokens（阈值 '
+              + (config.warnThreshold / 1000).toFixed(0) + 'k）——建议及时压缩（/compact）后再继续，避免超限中断。';
+            try {
+              agent.send(
+                createUserMessage({
+                  content: [{ type: 'text', text }],
+                  source: { kind: 'plugin', plugin: 'dsh-agent-context' },
+                }),
+                'next-turn',
+                true,
+              );
+            } catch { /* 发送失败静默（agent 可能已销毁） */ }
+          }
+        }
+      } catch { /* 测量失败静默 */ }
+    });
+  }
   ctx.effect(function* () {
     yield ctx.commands.register({
       name: 'context',
