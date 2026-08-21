@@ -25,19 +25,24 @@ import type {
 } from '@deepseek-ai/dsh-token-meter';
 import type { ProjectionSnapshot } from '@deepseek-ai/dsh-session-projection';
 import { formatReportText } from './format.js';
+// 2026-08-21 合并 dsh-agent-context-pruner：剪枝工具 + 入口守卫已并入本包（src/pruner.ts）
+import { applyPruner, Config as PrunerConfigSchema } from './pruner.ts';
 
 export const name = 'agent-context';
-export const inject = ['commands', 'tokenMeter', 'sessionProjections'];
+export const inject = ['commands', 'tokenMeter', 'sessionProjections', 'tools'];
 
 export interface Config {
   /** 上下文占用达到该阈值（tokens）时自动插话提醒（0 = 关闭）。 */
   warnThreshold: number
   /** 同一会话两次提醒的最小间隔（ms），防刷屏。 */
   warnCooldownMs: number
+  /** 2026-08-21 合并：透传给 dsh-agent-context-pruner 的配置（可选覆盖，缺省用其默认值）。 */
+  pruner?: Record<string, unknown>
 }
 export const Config = z.object({
   warnThreshold: z.number().default(500000),
   warnCooldownMs: z.number().default(3600000),
+  pruner: z.any().required(false),
 });
 
 /** 一次感知快照：上下文占用 + 已花费 token + 组成。 */
@@ -132,8 +137,7 @@ declare module '@deepseek-ai/cordis' {
 /** 注册 /context 命令并挂载 contextMeter 服务。 */
 export function apply(ctx: Context, config: Config): void {
   ctx.plugin(ContextMeter, config);
-  if (config.warnThreshold > 0) {
-    const warnedAt = new Map<string, number>();
+  if (config.warnThreshold > 0) {    const warnedAt = new Map<string, number>();
     ctx.on('agent/status', ({ agent, status }: { agent: Agent; status: string }) => {
       if (status !== 'idle') return;
       try {
@@ -175,4 +179,10 @@ export function apply(ctx: Context, config: Config): void {
       },
     });
   }, 'agent-context lifecycle');
+
+  // 2026-08-21 合并：本包内调用 applyPruner（剪枝工具 + 入口守卫）
+  // pruner 配置用自身 zod schema 解析（补默认值）；context 配置里的 pruner 覆盖段可精确调整。
+  const prunerRaw = (config as { pruner?: Record<string, unknown> }).pruner
+  const prunerConfig = PrunerConfigSchema(prunerRaw ?? {})
+  applyPruner(ctx as never, prunerConfig as never);
 }
