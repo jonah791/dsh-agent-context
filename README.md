@@ -1,3 +1,13 @@
+<!--
+  DSH 插件生态公约声明（plugin-ecosystem-convention · 组合优先/声明清晰/兼容优先）
+  purpose: 上下文治理一体化插件：/context 命令 + ctx.contextMeter 服务 + 剪枝工具（prune_candidates/apply/expand/guard/stats，合并自 dsh-agent-context-pruner）
+  inject: 'commands','tokenMeter','sessionProjections','tools'
+  tools: prune_candidates,prune_apply,prune_guard,prune_stats,expand
+  runtime: host-only
+  envDeps: 无（纯逻辑/标准 Node）
+  boundary: 无特殊授权边界
+  compat: cordis ^4.0.1 / dsh-tools ^0.1.0-rc.6
+-->
 # dsh-agent-context — 上下文管理插件
 
 DSH（DeepSeek Harness）插件：会话上下文的注入与管理。

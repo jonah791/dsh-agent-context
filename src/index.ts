@@ -157,7 +157,8 @@ export function apply(ctx: Context, config: Config): void {
                   content: [{ type: 'text', text }],
                   source: { kind: 'plugin', plugin: 'dsh-agent-context' },
                 }),
-                'next-turn',
+                // next-step（主人 2026-08-25）：提醒插到下一帧之前，而非等到下一回合结束才注入
+                'next-step',
                 true,
               );
             } catch { /* 发送失败静默（agent 可能已销毁） */ }
