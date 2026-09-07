@@ -10,6 +10,12 @@
 -->
 # dsh-agent-context — 上下文管理插件
 
+
+<p align="center">
+  <a href="https://github.com/jonah791/dsh-agent-context"><img src="https://img.shields.io/badge/version-0.2.0-blue" alt="version"></a>
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
+  <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
+</p>
 DSH（DeepSeek Harness）插件：会话上下文的注入与管理。
 
 ## 功能特性
