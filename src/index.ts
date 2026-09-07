@@ -29,7 +29,7 @@ import { formatReportText } from './format.js';
 import { applyPruner, Config as PrunerConfigSchema } from './pruner.ts';
 
 export const name = 'agent-context';
-export const inject = ['commands', 'tokenMeter', 'sessionProjections', 'tools'];
+export const inject = ['commands', 'tokenMeter', 'sessionProjections', 'tools', 'agents'];
 
 export interface Config {
   /** 上下文占用达到该阈值（tokens）时自动插话提醒（0 = 关闭）。 */
@@ -137,9 +137,18 @@ declare module '@deepseek-ai/cordis' {
 /** 注册 /context 命令并挂载 contextMeter 服务。 */
 export function apply(ctx: Context, config: Config): void {
   ctx.plugin(ContextMeter, config);
-  if (config.warnThreshold > 0) {    const warnedAt = new Map<string, number>();
-    ctx.on('agent/status', ({ agent, status }: { agent: Agent; status: string }) => {
-      if (status !== 'idle') return;
+  if (config.warnThreshold > 0) {
+    const warnedAt = new Map<string, number>();
+    // 2026-09-05 修复：触发时机从 agent/status(idle) 改为 session/event(turn/end)——原实现
+    // 依赖 agent 状态转换（idle→running→idle），守护重启恢复的会话/长时间 running 的会话
+    // 状态转换不完整 → 检查永不执行 → 压缩提醒从未触发（会话日志 0 条实证）。
+    // turn/end 每轮对话结束必触发，不依赖状态机。同一回调内同步 agent.send 会 reenter，
+    // 故用 setImmediate 延迟到 append 事务完成后投递（对齐 skill-forge 同款修复）。
+    ctx.on('session/event', (session: { id: string }, event: unknown) => {
+      const ev = event as { type?: string }
+      if (ev.type !== 'turn/end') return
+      const agent = ctx.agents?.get(session.id as never)
+      if (agent === undefined) return // agent 未找到：跳过（不阻塞，下轮重试）
       try {
         const report = buildReport(ctx.tokenMeter, ctx.sessionProjections, agent.session);
         const tokens = report.projectedTokens ?? report.totalTokens;
@@ -151,17 +160,20 @@ export function apply(ctx: Context, config: Config): void {
             const text = '【上下文提醒】当前上下文约 '
               + (tokens / 1000).toFixed(0) + 'k tokens（阈值 '
               + (config.warnThreshold / 1000).toFixed(0) + 'k）——建议及时压缩（/compact）后再继续，避免超限中断。';
-            try {
-              agent.send(
-                createUserMessage({
-                  content: [{ type: 'text', text }],
-                  source: { kind: 'plugin', plugin: 'dsh-agent-context' },
-                }),
-                // next-step（主人 2026-08-25）：提醒插到下一帧之前，而非等到下一回合结束才注入
-                'next-step',
-                true,
-              );
-            } catch { /* 发送失败静默（agent 可能已销毁） */ }
+            // reenter 修复：延迟到当前 session.append 事务完成后投递
+            setImmediate(() => {
+              try {
+                agent.send(
+                  createUserMessage({
+                    content: [{ type: 'text', text }],
+                    source: { kind: 'plugin', plugin: 'dsh-agent-context' },
+                  }),
+                  // next-step（主人 2026-08-25）：提醒插到下一帧之前，而非等到下一回合结束才注入
+                  'next-step',
+                  true,
+                );
+              } catch { /* 发送失败静默（agent 可能已销毁） */ }
+            });
           }
         }
       } catch { /* 测量失败静默 */ }

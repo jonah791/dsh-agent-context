@@ -175,11 +175,11 @@ export function applyPruner(ctx: Context, config: Config): void {
     '\n\n[guard: 大工具结果已折叠（原 ~' + chars + ' 码点；原文在会话日志，需要全文用 expand(callId="' + callId + '") 恢复）]'
 
   /** 扫描当前表层的 tool/result 候选（只读）。 */
-  function scanCandidates(session: { id: string; surface: { nodes: readonly number[] }; events: Record<number, unknown> }): CandidateInfo[] {
+  function scanCandidates(session: { id: string; surface: { nodes: readonly number[] }; eventAt(seq: number): unknown }): CandidateInfo[] {
     const nodes = [...session.surface.nodes]
     const tokenBySeq = new Map<number, number>()
     for (const seq of nodes) {
-      const event = session.events[seq] as { data?: { message?: Message } } | undefined
+      const event = session.eventAt(seq) as { data?: { message?: Message } } | undefined
       const message = event?.data?.message
       if (message !== undefined) tokenBySeq.set(seq, tokenMeter.estimateMessage(message))
     }
@@ -187,7 +187,7 @@ export function applyPruner(ctx: Context, config: Config): void {
     for (let i = 0; i < nodes.length; i += 1) {
       const seq = nodes[i]
       if (seq === undefined) continue
-      const event = session.events[seq] as unknown as ToolResultEventView | undefined
+      const event = session.eventAt(seq) as unknown as ToolResultEventView | undefined
       if (event?.type !== 'tool/result') continue
       const message = event.data?.message
       if (message === undefined) continue
@@ -256,7 +256,7 @@ export function applyPruner(ctx: Context, config: Config): void {
       const session = exec.agent?.session
       if (session === undefined) return { count: 0, candidates: [], note: '无可用会话' }
       const minChars = (args.minChars as number | undefined) ?? config.thresholdChars
-      const candidates = scanCandidates(session).filter((c) => c.chars >= minChars)
+      const candidates = scanCandidates(session as unknown as { id: string; surface: { nodes: readonly number[] }; eventAt(seq: number): unknown }).filter((c) => c.chars >= minChars)
       return {
         count: candidates.length,
         candidates: candidates.map((c) => ({
@@ -330,7 +330,7 @@ export function applyPruner(ctx: Context, config: Config): void {
       let tokensRemoved = 0
       for (const seq of seqs) {
         if (!nodes.has(seq)) continue
-        const event = session.events[seq] as unknown as ToolResultEventView | undefined
+        const event = (session as unknown as { eventAt(seq: number): unknown }).eventAt(seq) as unknown as ToolResultEventView | undefined
         if (event?.type !== 'tool/result') continue
         const message = event.data.message
         const result = message.content[0]
@@ -414,7 +414,7 @@ export function applyPruner(ctx: Context, config: Config): void {
       if (session === undefined) return { callId, note: '无可用会话；已加入豁免集' }
       // 找当前表层中 callId 匹配的 tool/result 节点
       for (const seq of [...session.surface.nodes]) {
-        const ev = session.events[seq] as unknown as {
+        const ev = (session as unknown as { eventAt(seq: number): unknown }).eventAt(seq) as unknown as {
           type?: string
           data?: { message?: { source?: { callId?: string } } }
           sourceEventSeqs?: number[]
@@ -423,7 +423,7 @@ export function applyPruner(ctx: Context, config: Config): void {
         if (ev.data?.message?.source?.callId !== callId) continue
         // 原始全量事件（若当前是折叠替换节点，sourceEventSeqs[0] 指向原始）
         const originalSeq = ev.sourceEventSeqs?.[0] ?? seq
-        const original = session.events[originalSeq] as unknown as { type?: string; data?: object } | undefined
+        const original = (session as unknown as { eventAt(seq: number): unknown }).eventAt(originalSeq) as unknown as { type?: string; data?: object } | undefined
         if (original?.type !== 'tool/result') continue
         const appendEvent = (session as unknown as { append: (t: string, d: unknown, o?: unknown) => { seq: number } }).append.bind(session)
         // 补 shadow-price claim：expand 恢复全量是 surface replace，token-meter 的
