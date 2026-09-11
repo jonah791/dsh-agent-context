@@ -351,7 +351,8 @@ export function applyPruner(ctx: Context, config: Config): void {
           shadowedTokenCount: tokensBefore,
         })
         const replacement = appendEvent('tool/result', { ...event.data, message: prunedMessage }, {
-          surfaceOp: { op: 'replace', start: seq, end: seq },
+          // V3 canonical envelope（2026-09-10 修复）：键名必须 startSeq/endSeq
+          surfaceOp: { op: 'replace', startSeq: seq, endSeq: seq },
           sourceEventSeqs: [seq],
         })
         pruned.push({
@@ -437,8 +438,11 @@ export function applyPruner(ctx: Context, config: Config): void {
           shadowedTokenCount: tokenMeter.estimateMessage(ev.data.message as unknown as Message),
         })
         // sourceEventSeqs 必须包含被遮蔽的当前表层节点（seq 本身）；originalSeq 只是原文来源
+        // 修复（2026-09-10）：V3 契约要求 surface replace 为 {op,startSeq,endSeq}——
+        // 旧 {op,start,end} 会在 session.append 处 fail-loud（invalid replace surfaceOp），
+        // expand 的替换体被丢弃 → 恢复被拒且 claim 与实际表层不对称
         const replacement = appendEvent('tool/result', { ...original.data }, {
-          surfaceOp: { op: 'replace', start: seq, end: seq },
+          surfaceOp: { op: 'replace', startSeq: seq, endSeq: seq },
           sourceEventSeqs: [seq],
         })
         return { callId, note: '已恢复全量（替换节点 ' + replacement.seq + '）；原文一直在会话日志中，replay-safe' }
@@ -601,7 +605,8 @@ export function applyPruner(ctx: Context, config: Config): void {
             shadowedTokenCount: tokenMeter.estimateMessage(msg as unknown as Message),
           })
           appendEvent('tool/result', { ...(ev.data as object), message: prunedMessage }, {
-            surfaceOp: { op: 'replace', start: seq, end: seq },
+            // V3 契约（2026-09-10 修复）：键名 startSeq/endSeq
+            surfaceOp: { op: 'replace', startSeq: seq, endSeq: seq },
             sourceEventSeqs: [seq],
           })
           if (!guard.folded.has(callId)) {
