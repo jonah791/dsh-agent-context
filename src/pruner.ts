@@ -324,11 +324,13 @@ export function applyPruner(ctx: Context, config: Config): void {
 
       const seqs = (args.seqs as number[] | undefined) ?? []
       if (seqs.length === 0) return { pruned: [], charsRemoved: 0, tokensRemoved: 0, stats: statsBySession.get(session.id) ?? { count: 0, charsRemoved: 0, tokensRemoved: 0, lastAt: '' }, note: '未指定 seqs（先跑 prune_candidates 查看候选）' }
-      const nodes = new Set(session.surface.nodes)
+      const nodes = new Set<string | number>(session.surface.nodes)
       const pruned: { originalSeq: number; replacementSeq: number; charsBefore: number; charsAfter: number; callId?: string }[] = []
       let charsRemoved = 0
       let tokensRemoved = 0
       for (const seq of seqs) {
+        // 宿主 0.1.5 起 surface 节点是 branded SessionSeq；此处只做集合成员判定，
+        // 用宽化集合避免引入 brand 辅助器（反射边界：不作为权威校验，eventAt/append 才是）
         if (!nodes.has(seq)) continue
         const event = (session as unknown as { eventAt(seq: number): unknown }).eventAt(seq) as unknown as ToolResultEventView | undefined
         if (event?.type !== 'tool/result') continue
