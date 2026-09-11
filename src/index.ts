@@ -27,6 +27,8 @@ import type { ProjectionSnapshot } from '@deepseek-ai/dsh-session-projection';
 import { formatReportText } from './format.js';
 // 2026-08-21 合并 dsh-agent-context-pruner：剪枝工具 + 入口守卫已并入本包（src/pruner.ts）
 import { applyPruner, Config as PrunerConfigSchema } from './pruner.ts';
+// 2026-09-11 预防缺口修复：把已躺在事件流里的压缩失败浮出水面（durable ≠ visible）
+import { latestCompactionFailure } from './compaction-watch.ts';
 
 export const name = 'agent-context';
 export const inject = ['commands', 'tokenMeter', 'sessionProjections', 'tools', 'agents'];
@@ -177,6 +179,51 @@ export function apply(ctx: Context, config: Config): void {
           }
         }
       } catch { /* 测量失败静默 */ }
+    });
+  }
+
+  // 压缩失败守望（2026-09-11 预防缺口修复）：压缩失败此前只落一行 logger.warn——
+  // dsh-agent-compact 的会话忙路径是 fire-and-forget（void run().then(..., logger.warn)），
+  // 且 compactNow 忙时立即返回 null（工具面显示「压缩已启动」），错误回不到调用方。
+  // 实测代价：10 次压缩全部失败、跨 2 天无人知晓，靠主人从「上下文没减少」的症状发现。
+  // 这里在 turn/end（每轮必发，不依赖状态机——同 5.12 教训）读出最近的 compaction/end.error
+  // 并投递提醒。fail-safe：纯读 + 字符串拼装，任何异常都静默 return，绝不影响会话或压缩本身。
+  {
+    /** 已提醒过的失败事件 seq（按 agent）。健康时清除，使后续新失败仍能提醒。 */
+    const notifiedFailureSeq = new Map<string, number>();
+    ctx.on('session/event', (session: { id: string }, event: unknown) => {
+      const ev = event as { type?: string }
+      if (ev.type !== 'turn/end') return
+      const agent = ctx.agents?.get(session.id as never)
+      if (agent === undefined) return
+      try {
+        // 单一类型转换发生在边界；纯函数侧只认 (seq:number) => unknown。
+        const readEvent = agent.session.eventAt.bind(agent.session) as (seq: number) => unknown
+        const failure = latestCompactionFailure(readEvent, agent.session.seq)
+        if (failure === null) {
+          notifiedFailureSeq.delete(agent.id)
+          return
+        }
+        if ((notifiedFailureSeq.get(agent.id) ?? -1) >= failure.seq) return
+        notifiedFailureSeq.set(agent.id, failure.seq)
+        const text = '【压缩告警】上一次压缩**失败**，上下文没有缩小——'
+          + failure.error
+          + '（compaction/end seq=' + failure.seq + '）。'
+          + '这是静默失效的高危信号：请先按事件流取证该错误再重试，不要当作已完成。';
+        // reenter 修复（同 5.12）：延迟到当前 session.append 事务完成后投递。
+        setImmediate(() => {
+          try {
+            agent.send(
+              createUserMessage({
+                content: [{ type: 'text', text }],
+                source: { kind: 'plugin', plugin: 'dsh-agent-context' },
+              }),
+              'next-step',
+              true,
+            );
+          } catch { /* 发送失败静默（agent 可能已销毁） */ }
+        });
+      } catch { /* 守望失败静默：绝不能因提醒而影响会话 */ }
     });
   }
   ctx.effect(function* () {
