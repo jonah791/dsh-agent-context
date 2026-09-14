@@ -9,7 +9,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { latestCompactionFailure, DEFAULT_LOOKBACK } from '../lib/compaction-watch.js';
+import { latestCompactionFailure, watchCompaction, DEFAULT_LOOKBACK } from '../lib/compaction-watch.js';
 
 /** 构造一个按 seq 取事件的读取器。 */
 function readerOf(events) {
@@ -115,4 +115,63 @@ test('健壮性：读取器返回 null/非对象/缺字段时不崩', () => {
   assert.equal(latestCompactionFailure(weird, 100), null, '缺 data 的事件不得抛错');
   const notObj = () => 42;
   assert.equal(latestCompactionFailure(notObj, 50), null, '非对象事件不得抛错');
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// 2026-09-14 假告警事故：读时是结论、投递时已过期（事件流 7940 start / 7952 end(error)
+// / 8092 start / 8108 end(成功)）。防线两条：飞行中不播报 + 投递前重验。
+// ────────────────────────────────────────────────────────────────────────────
+
+/** 构造一条 compaction/start 事件。 */
+function startEvent(seq, compactionId = 'c1') {
+  return { seq, type: 'compaction/start', data: { compactionId, sourceCommandId: 'alice-self-compact', turn: 1 } };
+}
+
+test('飞行中：start 之后还没有 end → inFlight=true（此刻的「最近失败」不得播报）', () => {
+  const read = readerOf([
+    startEvent(7940, 'f1'),
+    endEvent(7952, 'guard refused'),
+    startEvent(8092, 'f2'),
+  ]);
+  const w = watchCompaction(read, 8092);
+  assert.equal(w.inFlight, true, 'start 晚于最近 end = 压缩事务在飞行中，结论未定');
+  assert.equal(w.endSeq, 7952);
+  assert.notEqual(w.failure, null, '「最近一次已结束的压缩」确实是失败的——这正是旧版会播报的输入');
+  assert.equal(w.failure.seq, 7952);
+});
+
+test('投递前重验：飞行的那次成功落定 → failure 变 null（过期告警必须作废）', () => {
+  const read = readerOf([
+    startEvent(7940, 'f1'),
+    endEvent(7952, 'guard refused'),
+    startEvent(8092, 'f2'),
+    endEvent(8108), // 重试成功：无 error 键
+  ]);
+  const w = watchCompaction(read, 8108);
+  assert.equal(w.inFlight, false, 'end 晚于 start = 事务已落定');
+  assert.equal(w.endSeq, 8108);
+  assert.equal(w.failure, null, '已有更晚的成功 end，旧失败告警必须被抑制（否则制造狼来了）');
+});
+
+test('飞行中重验：新的失败落定 → failure 指向新 seq（下一轮按新结论播报）', () => {
+  const read = readerOf([endEvent(7952, 'old'), startEvent(8092, 'f2'), endEvent(8120, 'new')]);
+  const w = watchCompaction(read, 8120);
+  assert.equal(w.inFlight, false);
+  assert.equal(w.failure.seq, 8120, '重验口径同时覆盖「换成新失败」——旧 seq 不再匹配即作废');
+  assert.equal(w.failure.error, 'new');
+});
+
+test('兼容：latestCompactionFailure 仍是「最近一次已结束」的薄包装', () => {
+  const read = readerOf([startEvent(70, 'x'), endEvent(80, 'boom'), startEvent(90, 'y')]);
+  const failure = latestCompactionFailure(read, 90);
+  assert.notEqual(failure, null);
+  assert.equal(failure.seq, 80, '包装层语义不变：仍只报已结束的最近结论');
+  assert.equal(watchCompaction(read, 90).inFlight, true, '同一快照里同时暴露飞行状态');
+});
+
+test('健壮性：只有 start 没有 end（窗口内从未压缩成功过）→ inFlight=true 且 failure=null', () => {
+  const w = watchCompaction(readerOf([startEvent(30, 'only')]), 30);
+  assert.equal(w.inFlight, true);
+  assert.equal(w.endSeq, null);
+  assert.equal(w.failure, null);
 });

@@ -28,7 +28,7 @@ import { formatReportText } from './format.js';
 // 2026-08-21 合并 dsh-agent-context-pruner：剪枝工具 + 入口守卫已并入本包（src/pruner.ts）
 import { applyPruner, Config as PrunerConfigSchema } from './pruner.ts';
 // 2026-09-11 预防缺口修复：把已躺在事件流里的压缩失败浮出水面（durable ≠ visible）
-import { latestCompactionFailure } from './compaction-watch.ts';
+import { watchCompaction } from './compaction-watch.ts';
 
 export const name = 'agent-context';
 export const inject = ['commands', 'tokenMeter', 'sessionProjections', 'tools', 'agents'];
@@ -199,7 +199,11 @@ export function apply(ctx: Context, config: Config): void {
       try {
         // 单一类型转换发生在边界；纯函数侧只认 (seq:number) => unknown。
         const readEvent = agent.session.eventAt.bind(agent.session) as (seq: number) => unknown
-        const failure = latestCompactionFailure(readEvent, agent.session.seq)
+        const watch = watchCompaction(readEvent, agent.session.seq)
+        // 飞行中不播报（2026-09-14 假告警事故）：此刻读到的「最近一次已结束的压缩失败」可能
+        // 正被新一轮压缩取代；等它落定，下一个 turn/end 自会按结论播报。
+        if (watch.inFlight) return
+        const failure = watch.failure
         if (failure === null) {
           notifiedFailureSeq.delete(agent.id)
           return
@@ -213,6 +217,10 @@ export function apply(ctx: Context, config: Config): void {
         // reenter 修复（同 5.12）：延迟到当前 session.append 事务完成后投递。
         setImmediate(() => {
           try {
+            // 投递前重验（2026-09-14 假告警事故）：读时是结论、投递时可能已过期——若已有
+            // 更晚的 compaction/end 落定（成功或失败），本条告警作废，交给下一轮按新结论播报。
+            const now = watchCompaction(readEvent, agent.session.seq)
+            if (now.failure === null || now.failure.seq !== failure.seq) return
             agent.send(
               createUserMessage({
                 content: [{ type: 'text', text }],

@@ -30,11 +30,63 @@ export interface CompactionFailure {
   readonly error: string
 }
 
+/** 压缩状态快照：供调用方区分「已结束的结论」与「还在飞行中的事务」。 */
+export interface CompactionWatch {
+  /** 最近一次**已结束**的压缩是失败时给出，否则 null（= 健康或在飞行）。 */
+  readonly failure: CompactionFailure | null
+  /** 最近一次 `compaction/end` 的 seq（窗口内没有则 null）。 */
+  readonly endSeq: number | null
+  /**
+   * 有 `compaction/start` 晚于最近一次 `compaction/end` —— 压缩事务**在飞行中**，结论未定。
+   *
+   * 2026-09-14 假告警事故：turn/end 读到「最近一次已结束的压缩失败」，但此刻**新一轮压缩
+   * 正在飞行**；提醒经 `next-step` 投递，落地时飞行的那次已经成功结束（事件流 8092 start
+   * → 8108 end 无错），于是主人收到一条**已经过期**的失败告警，看起来像「又失败了一次」。
+   * 飞行中不播报 + 投递前重验 = 该形状的双重防线。
+   */
+  readonly inFlight: boolean
+}
+
 /** 默认回溯窗口：足够覆盖一次到数轮对话内的压缩事件。 */
 export const DEFAULT_LOOKBACK = 400
 
 /** 判定为压缩失败所需的最小错误文本长度（防空串误报）。 */
 const MIN_ERROR_LENGTH = 1
+
+/**
+ * 从会话尾部向前、在 `lookback` 窗口内读出压缩状态（一次扫描同时定出「最近结论」与「是否在飞行」）。
+ *
+ * @param read - 按 seq 读取事件的读取器（调用方用 `session.eventAt` 包裹）。
+ * @param fromSeq - 起点（通常是 `session.seq`：日志里最大的 seq）。
+ * @param lookback - 最多向前回溯多少个 seq。
+ */
+export function watchCompaction(
+  read: (seq: number) => unknown,
+  fromSeq: number,
+  lookback: number = DEFAULT_LOOKBACK,
+): CompactionWatch {
+  const floor = Math.max(0, fromSeq - lookback)
+  let endSeq: number | null = null
+  let error: string | null = null
+  let startSeq: number | null = null
+  for (let seq = fromSeq; seq >= floor; seq -= 1) {
+    const event = read(seq) as { type?: unknown; data?: unknown } | undefined | null
+    if (event === null || typeof event !== 'object') continue
+    const type = event.type
+    if (type === 'compaction/end' && endSeq === null) {
+      endSeq = seq
+      const data = event.data as { error?: unknown } | undefined | null
+      const raw = data === null || typeof data !== 'object' ? undefined : data.error
+      if (typeof raw === 'string' && raw.length >= MIN_ERROR_LENGTH) error = raw
+    } else if (type === 'compaction/start' && startSeq === null) {
+      startSeq = seq
+    }
+    if (endSeq !== null && startSeq !== null) break
+  }
+  const failure = endSeq !== null && error !== null ? { seq: endSeq, error } : null
+  const inFlight = startSeq !== null && startSeq > (endSeq ?? -1)
+  return { failure, endSeq, inFlight }
+}
 
 /**
  * 从会话尾部向前、在 `lookback` 窗口内找**最近一次** `compaction/end`，
@@ -50,18 +102,5 @@ export function latestCompactionFailure(
   fromSeq: number,
   lookback: number = DEFAULT_LOOKBACK,
 ): CompactionFailure | null {
-  const floor = Math.max(0, fromSeq - lookback)
-  for (let seq = fromSeq; seq >= floor; seq -= 1) {
-    const event = read(seq) as { type?: unknown; data?: unknown } | undefined | null
-    if (event === null || typeof event !== 'object') continue
-    if (event.type !== 'compaction/end') continue
-    const data = event.data as { error?: unknown } | undefined | null
-    const error = data === null || typeof data !== 'object' ? undefined : data.error
-    if (typeof error === 'string' && error.length >= MIN_ERROR_LENGTH) {
-      return { seq, error }
-    }
-    // 最近一次 compaction/end 无错 = 当前健康；旧错误不报。
-    return null
-  }
-  return null
+  return watchCompaction(read, fromSeq, lookback).failure
 }
