@@ -29,6 +29,20 @@ import { formatReportText } from './format.js';
 import { applyPruner, Config as PrunerConfigSchema } from './pruner.ts';
 // 2026-09-11 预防缺口修复：把已躺在事件流里的压缩失败浮出水面（durable ≠ visible）
 import { watchCompaction } from './compaction-watch.ts';
+// 2026-09-14：提醒状态落盘（治「重启即失忆 → 同一笔旧失败反复播报」）
+import { readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import {
+  EMPTY_REMINDER_STATE,
+  parseReminderState,
+  reminderStatePath,
+  serializeReminderState,
+  shouldNotifyFailure,
+  shouldWarn,
+  withFailureNotified,
+  withWarned,
+  withoutFailure,
+} from './reminder-state.ts';
 
 export const name = 'agent-context';
 export const inject = ['commands', 'tokenMeter', 'sessionProjections', 'tools', 'agents'];
@@ -139,8 +153,26 @@ declare module '@deepseek-ai/cordis' {
 /** 注册 /context 命令并挂载 contextMeter 服务。 */
 export function apply(ctx: Context, config: Config): void {
   ctx.plugin(ContextMeter, config);
+  // ── 提醒状态的持久化（2026-09-14）──
+  // 去重/冷却原本只在内存（两个 Map）⇒ 每次 web 重启把**同一笔旧压缩失败**再播报一次
+  // （实测：compaction/end seq=9088 的告警在 09:32:45 重启后重复投递 = 狼来了），
+  // 且冷却归零会反复提醒同一会话。这与 §5.12 §3「提醒类机制要有存活证据」同根：
+  // **状态只在内存 = 重启即失忆**。落盘后跨重启有效；坏数据一律回落空状态（fail-safe）。
+  const home = process.env.DSH_HOME !== undefined && process.env.DSH_HOME.trim() !== ''
+    ? process.env.DSH_HOME
+    : homedir() + '/.dsh'
+  const statePath = reminderStatePath(home)
+  let reminderState = EMPTY_REMINDER_STATE
+  try {
+    reminderState = parseReminderState(JSON.parse(readFileSync(statePath, 'utf8')))
+  } catch { /* 文件缺失/不可解析 → 空状态（照常工作） */ }
+  /** 写盘 fail-safe：写失败不影响投递本身。 */
+  const persistReminderState = (): void => {
+    try {
+      writeFileSync(statePath, serializeReminderState(reminderState), 'utf8')
+    } catch { /* 写失败不阻塞 */ }
+  }
   if (config.warnThreshold > 0) {
-    const warnedAt = new Map<string, number>();
     // 2026-09-05 修复：触发时机从 agent/status(idle) 改为 session/event(turn/end)——原实现
     // 依赖 agent 状态转换（idle→running→idle），守护重启恢复的会话/长时间 running 的会话
     // 状态转换不完整 → 检查永不执行 → 压缩提醒从未触发（会话日志 0 条实证）。
@@ -155,10 +187,11 @@ export function apply(ctx: Context, config: Config): void {
         const report = buildReport(ctx.tokenMeter, ctx.sessionProjections, agent.session);
         const tokens = report.projectedTokens ?? report.totalTokens;
         if (tokens >= config.warnThreshold) {
-          const last = warnedAt.get(agent.id) ?? 0;
           const now = Date.now();
-          if (now - last >= config.warnCooldownMs) {
-            warnedAt.set(agent.id, now);
+          // 冷却判据读**落盘状态**（跨重启有效）；先落状态再投递（同失败通道的「先落盘」纪律）
+          if (shouldWarn(reminderState, agent.id, now, config.warnCooldownMs)) {
+            reminderState = withWarned(reminderState, agent.id, now);
+            persistReminderState();
             const text = '【上下文提醒】当前上下文约 '
               + (tokens / 1000).toFixed(0) + 'k tokens（阈值 '
               + (config.warnThreshold / 1000).toFixed(0) + 'k）——建议及时压缩（/compact）后再继续，避免超限中断。';
@@ -189,8 +222,6 @@ export function apply(ctx: Context, config: Config): void {
   // 这里在 turn/end（每轮必发，不依赖状态机——同 5.12 教训）读出最近的 compaction/end.error
   // 并投递提醒。fail-safe：纯读 + 字符串拼装，任何异常都静默 return，绝不影响会话或压缩本身。
   {
-    /** 已提醒过的失败事件 seq（按 agent）。健康时清除，使后续新失败仍能提醒。 */
-    const notifiedFailureSeq = new Map<string, number>();
     ctx.on('session/event', (session: { id: string }, event: unknown) => {
       const ev = event as { type?: string }
       if (ev.type !== 'turn/end') return
@@ -205,11 +236,19 @@ export function apply(ctx: Context, config: Config): void {
         if (watch.inFlight) return
         const failure = watch.failure
         if (failure === null) {
-          notifiedFailureSeq.delete(agent.id)
+          // 健康 → 清除该 agent 的失败记录（使将来的新失败仍能播报）
+          const cleared = withoutFailure(reminderState, agent.id)
+          if (cleared !== reminderState) {
+            reminderState = cleared
+            persistReminderState()
+          }
           return
         }
-        if ((notifiedFailureSeq.get(agent.id) ?? -1) >= failure.seq) return
-        notifiedFailureSeq.set(agent.id, failure.seq)
+        // 去重读**落盘状态**（2026-09-14 修复）：只读内存时，每次重启都会把同一笔旧失败
+        // 再播报一次（seq=9088 实测重复投递 = 狼来了）。
+        if (!shouldNotifyFailure(reminderState, agent.id, failure.seq)) return
+        reminderState = withFailureNotified(reminderState, agent.id, failure.seq)
+        persistReminderState()
         const text = '【压缩告警】上一次压缩**失败**，上下文没有缩小——'
           + failure.error
           + '（compaction/end seq=' + failure.seq + '）。'
