@@ -1,0 +1,26 @@
+{
+  "$schema": "https://example.invalid/dsh-community-fabric/dsh-plugin.schema.v0.1.draft.json",
+  "manifestVersion": "0.1.0",
+  "id": "com.jonah791.agent-context",
+  "name": "dsh-agent-context",
+  "version": "0.2.3",
+  "apiVersion": ">=0.1.0 <0.2.0",
+  "entrypoints": {
+    "host": "lib/fabric.js"
+  },
+  "capabilities": {
+    "required": {
+      "commands": ">=0.1.0 <0.2.0"
+    },
+    "optional": {}
+  },
+  "subscriptions": [],
+  "contributes": {
+    "commands": [
+      {
+        "id": "com.jonah791.agent-context.context",
+        "title": "Show context occupancy and tokens spent for this session"
+      }
+    ]
+  }
+}
