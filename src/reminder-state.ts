@@ -19,14 +19,20 @@
 export interface ReminderState {
   /** 已播报过的失败 `compaction/end` seq（同一 seq 只播一次，跨重启有效）。 */
   readonly failureSeqByAgent: Record<string, number>
-  /** 上次上下文提醒时刻（ms），用于冷却。 */
+  /** 上次上下文提醒时刻（ms），用于**绝对阈值**通道的冷却。 */
   readonly warnedAtByAgent: Record<string, number>
+  /**
+   * 已提醒到的**梯级**（百分比档），用于**梯级插话**通道的去重（2026-09-22）。
+   * 语义：数值 ＝ 该 agent 已经报过的最高档（如 50 档意味着 50% 报过、65% 未报）。
+   */
+  readonly warnedStepByAgent: Record<string, number>
 }
 
 /** 空状态（未授权/文件缺失/文件损坏一律回落到它）。 */
 export const EMPTY_REMINDER_STATE: ReminderState = Object.freeze({
   failureSeqByAgent: {},
   warnedAtByAgent: {},
+  warnedStepByAgent: {},
 })
 
 /** 只保留字符串键 → 有限数字值的记录（其余一律丢弃）。 */
@@ -47,10 +53,11 @@ function numberRecord(value: unknown): Record<string, number> {
  */
 export function parseReminderState(raw: unknown): ReminderState {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return EMPTY_REMINDER_STATE
-  const record = raw as { failureSeqByAgent?: unknown; warnedAtByAgent?: unknown }
+  const record = raw as { failureSeqByAgent?: unknown; warnedAtByAgent?: unknown; warnedStepByAgent?: unknown }
   return {
     failureSeqByAgent: numberRecord(record.failureSeqByAgent),
     warnedAtByAgent: numberRecord(record.warnedAtByAgent),
+    warnedStepByAgent: numberRecord(record.warnedStepByAgent),
   }
 }
 
@@ -63,7 +70,46 @@ export function serializeReminderState(state: ReminderState): string {
   return JSON.stringify({
     failureSeqByAgent: state.failureSeqByAgent,
     warnedAtByAgent: state.warnedAtByAgent,
+    warnedStepByAgent: state.warnedStepByAgent,
   })
+}
+
+/**
+ * **梯级插话**的裁决（2026-09-22 主人指令：「上下文感知要走插话形式」+ 主人手动报了「已用 57% ~568K/1M」）。
+ *
+ * 问题：原通道是**单一绝对阈值**（50 万 tokens）＋ **一小时冷却** ⇒ 用量爬到 57% 时仍被冷却压住，
+ * 感知到不了我这儿，只能等主人手动插一句。⇒ 改为**随用量递进的档位**：每跨过一档就插一次话，
+ * 每档只插一次（去重靠持久化的「已报最高档」，跨重启有效）。
+ *
+ * @param percents - 档位（升序、0–100）
+ * @param usedTokens - 当前占用
+ * @param contextWindow - 窗口容量（拿不到 ⇒ 返回 `null`，退回绝对阈值通道）
+ * @param lastStep - 该 agent 已报过的最高档
+ * @returns 该报的档（含实际百分比）；不该报或算不出 ⇒ `null`
+ */
+export function nextWarnStep(
+  percents: readonly number[],
+  usedTokens: number,
+  contextWindow: number | undefined,
+  lastStep: number,
+): { step: number; percent: number } | null {
+  if (contextWindow === undefined || !Number.isFinite(contextWindow) || contextWindow <= 0) return null
+  if (!Number.isFinite(usedTokens) || usedTokens < 0) return null
+  const ratio = usedTokens / contextWindow
+  let hit: number | null = null
+  for (const p of percents) {
+    if (!Number.isFinite(p) || p <= 0 || p > 100) continue
+    if (ratio * 100 >= p && p > lastStep) hit = hit === null ? p : Math.max(hit, p)
+  }
+  if (hit === null) return null
+  return { step: hit, percent: Math.round(ratio * 100) }
+}
+
+/** 记录一次梯级插话（不可变更新）。 */
+export function withWarnedStep(state: ReminderState, agentId: string, step: number): ReminderState {
+  const prev = state.warnedStepByAgent[agentId] ?? 0
+  if (step <= prev) return state
+  return { ...state, warnedStepByAgent: { ...state.warnedStepByAgent, [agentId]: step } }
 }
 
 /**

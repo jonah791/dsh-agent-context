@@ -41,6 +41,8 @@ import {
   shouldWarn,
   withFailureNotified,
   withWarned,
+  nextWarnStep,
+  withWarnedStep,
   withoutFailure,
 } from './reminder-state.ts';
 
@@ -48,16 +50,23 @@ export const name = 'agent-context';
 export const inject = ['commands', 'tokenMeter', 'sessionProjections', 'tools', 'agents'];
 
 export interface Config {
-  /** 上下文占用达到该阈值（tokens）时自动插话提醒（0 = 关闭）。 */
+  /** 上下文占用达到该阈值（tokens）时自动插话提醒（0 = 关闭）。**旧通道**：窗口拿不到时仍用它。 */
   warnThreshold: number
-  /** 同一会话两次提醒的最小间隔（ms），防刷屏。 */
+  /** 同一会话两次提醒的最小间隔（ms），防刷屏（只管**旧通道**）。 */
   warnCooldownMs: number
+  /**
+   * **梯级插话**的档位（百分比，升序）。2026-09-22 主人指令：「上下文感知要走插话形式」。
+   * 拿得到 `contextWindow` 时按它递进：每跨过一档插一次话，**每档只插一次**（持久化去重）。
+   * 空数组 = 关掉梯级通道，只剩旧通道。默认 [50, 65, 80, 90]。
+   */
+  warnAtPercents: number[]
   /** 2026-08-21 合并：透传给 dsh-agent-context-pruner 的配置（可选覆盖，缺省用其默认值）。 */
   pruner?: Record<string, unknown>
 }
 export const Config = z.object({
   warnThreshold: z.number().default(500000),
   warnCooldownMs: z.number().default(3600000),
+  warnAtPercents: z.array(z.number()).default([50, 65, 80, 90]),
   pruner: z.any().required(false),
 });
 
@@ -172,7 +181,7 @@ export function apply(ctx: Context, config: Config): void {
       writeFileSync(statePath, serializeReminderState(reminderState), 'utf8')
     } catch { /* 写失败不阻塞 */ }
   }
-  if (config.warnThreshold > 0) {
+  if (config.warnThreshold > 0 || config.warnAtPercents.length > 0) {
     // 2026-09-05 修复：触发时机从 agent/status(idle) 改为 session/event(turn/end)——原实现
     // 依赖 agent 状态转换（idle→running→idle），守护重启恢复的会话/长时间 running 的会话
     // 状态转换不完整 → 检查永不执行 → 压缩提醒从未触发（会话日志 0 条实证）。
@@ -183,32 +192,59 @@ export function apply(ctx: Context, config: Config): void {
       if (ev.type !== 'turn/end') return
       const agent = ctx.agents?.get(session.id as never)
       if (agent === undefined) return // agent 未找到：跳过（不阻塞，下轮重试）
+      /** 插话的**唯一投递口**：两条通道共用它，保证「形式」永远一致（主人 2026-09-22：「要走插话形式」）。 */
+      const interject = (text: string): void => {
+        // reenter 修复：延迟到当前 session.append 事务完成后投递
+        setImmediate(() => {
+          try {
+            agent.send(
+              createUserMessage({
+                content: [{ type: 'text', text }],
+                source: { kind: 'plugin', plugin: 'dsh-agent-context' },
+              }),
+              // next-step（主人 2026-08-25）：提醒插到下一帧之前，而非等到下一回合结束才注入
+              'next-step',
+              true,
+            );
+          } catch { /* 发送失败静默（agent 可能已销毁） */ }
+        });
+      };
       try {
         const report = buildReport(ctx.tokenMeter, ctx.sessionProjections, agent.session);
         const tokens = report.projectedTokens ?? report.totalTokens;
-        if (tokens >= config.warnThreshold) {
+
+        // ── ① 梯级插话（2026-09-22 主人指令）──────────────────────────────
+        // 旧通道是「单一绝对阈值 + 一小时冷却」⇒ 用量爬到 57% 时仍被冷却压住，感知到不了我这里，
+        // 只能等主人手动插一句。改为**随用量递进的档位**：每跨一档插一次，每档只插一次。
+        const step = nextWarnStep(
+          config.warnAtPercents,
+          tokens,
+          report.contextWindow,
+          reminderState.warnedStepByAgent[agent.id] ?? 0,
+        );
+        if (step !== null) {
+          const now = Date.now();
+          // 先落盘再投递（同「先落盘」纪律）：投递失败也不会重复轰炸
+          reminderState = withWarnedStep(reminderState, agent.id, step.step);
+          reminderState = withWarned(reminderState, agent.id, now);
+          persistReminderState();
+          const win = report.contextWindow ?? 0;
+          interject('【上下文提醒】上下文已用 **' + step.percent + '%**（约 '
+            + (tokens / 1000).toFixed(0) + 'K / ' + (win / 1000).toFixed(0) + 'K）'
+            + '——已跨过 ' + step.step + '% 档。建议压缩（/compact）或剪枝后再继续，避免超限中断。');
+          return;
+        }
+
+        // ── ② 旧通道：绝对阈值 + 冷却（窗口拿不到 / 档位为空时仍可用）────────
+        if (config.warnThreshold > 0 && tokens >= config.warnThreshold) {
           const now = Date.now();
           // 冷却判据读**落盘状态**（跨重启有效）；先落状态再投递（同失败通道的「先落盘」纪律）
           if (shouldWarn(reminderState, agent.id, now, config.warnCooldownMs)) {
             reminderState = withWarned(reminderState, agent.id, now);
             persistReminderState();
-            const text = '【上下文提醒】当前上下文约 '
+            interject('【上下文提醒】当前上下文约 '
               + (tokens / 1000).toFixed(0) + 'k tokens（阈值 '
-              + (config.warnThreshold / 1000).toFixed(0) + 'k）——建议及时压缩（/compact）后再继续，避免超限中断。';
-            // reenter 修复：延迟到当前 session.append 事务完成后投递
-            setImmediate(() => {
-              try {
-                agent.send(
-                  createUserMessage({
-                    content: [{ type: 'text', text }],
-                    source: { kind: 'plugin', plugin: 'dsh-agent-context' },
-                  }),
-                  // next-step（主人 2026-08-25）：提醒插到下一帧之前，而非等到下一回合结束才注入
-                  'next-step',
-                  true,
-                );
-              } catch { /* 发送失败静默（agent 可能已销毁） */ }
-            });
+              + (config.warnThreshold / 1000).toFixed(0) + 'k）——建议及时压缩（/compact）后再继续，避免超限中断。');
           }
         }
       } catch { /* 测量失败静默 */ }
