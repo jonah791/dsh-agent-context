@@ -24,6 +24,8 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { freezeMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
+import { inspectContent, planLevels, suggestLevel, PRUNE_LEVELS } from './prune-plan.ts'
+import type { ContentFlags, LevelPlan, PruneLevel } from './prune-plan.ts'
 
 export const prunerName = 'agent-context-pruner'
 export const prunerInject = ['tools', 'tokenMeter'] as const
@@ -119,6 +121,12 @@ interface CandidateInfo {
   overBudget: boolean
   cacheCostTokens: number
   positionHint: 'tail' | 'near-tail' | 'middle'
+  /** 内容指纹（2026-09-20 移植自 fast-jev-compaction 的「第二问」）：「重跑工具能否替代」的可计算代理 */
+  flags: ContentFlags
+  /** 三档渐进方案的字符账（L1/L2/L3 各能省多少）—— 选哪档归爱丽丝 */
+  levels: LevelPlan[]
+  /** 建议档位（只是建议，不是指令） */
+  suggest: PruneLevel
 }
 
 /** 一轮模型请求的实测 token 计量（provider usage 透传）。 */
@@ -195,6 +203,14 @@ export function applyPruner(ctx: Context, config: Config): void {
       const blocks = result?.type === 'tool-result' ? result.content : undefined
       const chars = blocks === undefined ? 0 : measureContent(blocks)
       const tokens = tokenBySeq.get(seq) ?? 0
+      // 内容指纹 + 三档字符账（2026-09-20 移植自 fast-jev-compaction）：
+      // 只报信号与账目，不下裁决 —— 剪不剪、剪哪档，仍归爱丽丝。
+      const text = blocks === undefined
+        ? ''
+        : blocks.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('\n')
+      const flags = inspectContent(text)
+      const levels = planLevels(chars)
+      const suggest = suggestLevel(flags)
       let cacheCost = 0
       for (let j = i + 1; j < nodes.length; j += 1) {
         const s = nodes[j]
@@ -212,6 +228,9 @@ export function applyPruner(ctx: Context, config: Config): void {
         overBudget: chars > config.thresholdChars,
         cacheCostTokens: cacheCost,
         positionHint,
+        flags,
+        levels,
+        suggest,
       })
     }
     return candidates
@@ -219,7 +238,7 @@ export function applyPruner(ctx: Context, config: Config): void {
 
   const pruneCandidatesTool: ToolDefinition = defineTool({
     name: 'prune_candidates',
-    description: '上下文剪枝候选检测（只读）：扫描当前会话表层的工具结果节点，列出可剪候选——每个候选含 seq/轮次/大小/估算 token/是否超预算/剪后缓存代价（其后内容需重新 prefill 的一次性 token 成本）/位置提示（tail=零缓存破坏，near-tail=小代价，middle=大代价）。是否剪、剪哪些由爱丽丝判断：判断纪律三问「结论已落盘？可低成本重取？不在当前任务链？」全满足才值得剪；剪前自问「主人下一句就问这个，我能答上来吗？」',
+    description: '上下文剪枝候选检测（只读）：扫描当前会话表层的工具结果节点，列出可剪候选——每个候选含 seq/轮次/大小/估算 token/是否超预算/剪后缓存代价（其后内容需重新 prefill 的一次性 token 成本）/位置提示（tail=零缓存破坏，near-tail=小代价，middle=大代价）。**2026-09-20 移植自 fast-jev-compaction**：另含 ① 内容指纹 flags（error/paths/unique-ids/commands/homogeneous —— 「重跑工具能否替代」的可计算代理；含不可重取信号则建议保守）② 三档字符账 levels（L1/L2/L3 各剪完剩多少、省多少）③ 建议档位 suggest（只是建议）。是否剪、剪哪些、**剪哪档**由爱丽丝判断：判断纪律三问「结论已落盘？可低成本重取？不在当前任务链？」全满足才值得剪；剪前自问「主人下一句就问这个，我能答上来吗？」',
     parameters: {
       minChars: { type: 'number', description: '只列出超过此字符数的候选（缺省用插件阈值，传 0 列出全部）' },
     },
@@ -241,6 +260,12 @@ export function applyPruner(ctx: Context, config: Config): void {
                 tokens: { type: 'number', required: true },
                 overBudget: { type: 'boolean', required: true },
                 cacheCostTokens: { type: 'number', required: true },
+                /** 建议档位（L1-head-tail / L2-heavy / L3-note-only）—— 只是建议，不是指令 */
+                suggest: { type: 'string', required: true },
+                /** 内容指纹：不可重取信号（error / paths / unique-ids / commands / homogeneous） */
+                flags: { type: 'json', required: true },
+                /** 三档字符账（各级剪完剩多少、能省多少） */
+                levels: { type: 'json', required: true },
                 turn: { type: 'number' },
                 callId: { type: 'string' },
               },
@@ -250,7 +275,35 @@ export function applyPruner(ctx: Context, config: Config): void {
           note: { type: 'string', required: true },
         },
       },
-      render: (args, value) => [{ type: 'text', text: `候选 ${value.count} 个（minChars=${args.minChars ?? '缺省'}）——决策归爱丽丝` }],
+      render: (args, value) => {
+        // 逐候选明细（2026-09-20）：新字段（指纹/三档账/建议）必须**呈现给模型**才有意义 ——
+        // 只渲染一行摘要时，算出来的字段我读不到，等于没移植。
+        const list = (value.candidates ?? []) as unknown as {
+          seq: number
+          positionHint: string
+          chars: number
+          tokens: number
+          cacheCostTokens: number
+          overBudget: boolean
+          suggest?: string
+          flags?: { flags?: string[]; irreplaceable?: boolean }
+          levels?: { level: string; savedChars: number; effective: boolean }[]
+        }[]
+        const head = `候选 ${value.count} 个（minChars=${args.minChars ?? '缺省'}）——**决策归爱丽丝**；tail 零缓存破坏优先，⚠不可重取者宜用 L1`
+        if (list.length === 0) return [{ type: 'text', text: head }]
+        const lines = list.map((c) => {
+          const lv = (c.levels ?? [])
+            .filter((l) => l.effective)
+            .map((l) => l.level.replace(/^L(\d).*/, 'L$1') + ':省' + String(l.savedChars))
+            .join(' ')
+          const sigs = c.flags?.flags ?? []
+          const sig = sigs.length > 0 ? sigs.join(',') : '—'
+          const irre = c.flags?.irreplaceable === true ? ' ⚠不可重取' : ''
+          const over = c.overBudget ? ' 超预算' : ''
+          return `#${c.seq} ${c.positionHint}${over} ${c.chars}码/${c.tokens}tok 缓存代价${c.cacheCostTokens}tok | 指纹[${sig}]${irre} | 建议 ${c.suggest ?? '?'} | ${lv.length > 0 ? lv : '—'}`
+        })
+        return [{ type: 'text', text: head + String.fromCharCode(10) + lines.join(String.fromCharCode(10)) }]
+      },
     },
     async execute(args, exec) {
       const session = exec.agent?.session
@@ -268,6 +321,25 @@ export function applyPruner(ctx: Context, config: Config): void {
           cacheCostTokens: c.cacheCostTokens,
           turn: c.turn,
           callId: c.callId,
+          suggest: c.suggest,
+          // 显式展开为 plain object：schema 的 `json` 类型要求 JsonValue，而具名 interface 缺索引签名
+          flags: {
+            hasError: c.flags.hasError,
+            hasPaths: c.flags.hasPaths,
+            hasUniqueIds: c.flags.hasUniqueIds,
+            hasCommands: c.flags.hasCommands,
+            homogeneous: c.flags.homogeneous,
+            irreplaceable: c.flags.irreplaceable,
+            flags: c.flags.flags,
+          },
+          levels: c.levels.map((l) => ({
+            level: l.level,
+            headChars: l.headChars,
+            tailChars: l.tailChars,
+            charsAfter: l.charsAfter,
+            savedChars: l.savedChars,
+            effective: l.effective,
+          })),
         })),
         note: '剪枝判断归爱丽丝：tail 零缓存破坏可放心剪；middle 仅在「节省 × 剩余轮数 > 缓存代价」时剪',
       }
@@ -276,9 +348,14 @@ export function applyPruner(ctx: Context, config: Config): void {
 
   const pruneApplyTool: ToolDefinition = defineTool({
     name: 'prune_apply',
-    description: '执行上下文剪枝（可写）：按候选 seq 剪指定 tool/result 节点——头+标记+尾保留，replay-safe（仅追加日志保留完整原始事件，可回放恢复；每次替换前写 compaction/prune 定价事件）。不在表层/非 tool/result/预算内节点自动跳过，幂等。剪枝前请先跑 prune_candidates 并确认判断纪律。',
+    description: '执行上下文剪枝（可写）：按候选 seq 剪指定 tool/result 节点——头+标记+尾保留，replay-safe（仅追加日志保留完整原始事件，可回放恢复；每次替换前写 compaction/prune 定价事件）。**2026-09-20 新增 level 档位**（移植自 fast-jev-compaction 的渐进降级）：L1=头 4096+尾 1024（缺省，与旧行为一致）/ L2=头 1024+尾 256 / L3=只留一行注记（适合可重取的同质大块，剪得最狠）。不在表层/非 tool/result/预算内节点自动跳过，幂等。剪枝前请先跑 prune_candidates 看 suggest 与 levels，并确认判断纪律。',
     parameters: {
       seqs: { type: 'array', items: { type: 'number' }, description: '要剪的候选 seq 列表（来自 prune_candidates）' },
+      level: {
+        type: 'string',
+        enum: ['L1-head-tail', 'L2-heavy', 'L3-note-only'],
+        description: '剪枝档位（2026-09-20 移植的渐进降级）：L1=头 4096+尾 1024（保守，缺省）/ L2=头 1024+尾 256（加强）/ L3=只留一行注记（激进，适合可重取的同质大块）。逐 seq 生效；建议值见 prune_candidates 的 suggest 字段。',
+      },
     },
     output: {
       schema: {
@@ -323,6 +400,9 @@ export function applyPruner(ctx: Context, config: Config): void {
       if (session === undefined) return { pruned: [], charsRemoved: 0, tokensRemoved: 0, stats: { count: 0, charsRemoved: 0, tokensRemoved: 0, lastAt: '' }, note: '无可用会话' }
 
       const seqs = (args.seqs as number[] | undefined) ?? []
+      // 档位解析（2026-09-20 移植）：缺省 L1 = 与旧行为完全一致（向后兼容，最小变更）
+      const level = (args.level as PruneLevel | undefined) ?? 'L1-head-tail'
+      const { headChars: levelHead, tailChars: levelTail } = PRUNE_LEVELS[level] ?? PRUNE_LEVELS['L1-head-tail']
       if (seqs.length === 0) return { pruned: [], charsRemoved: 0, tokensRemoved: 0, stats: statsBySession.get(session.id) ?? { count: 0, charsRemoved: 0, tokensRemoved: 0, lastAt: '' }, note: '未指定 seqs（先跑 prune_candidates 查看候选）' }
       const nodes = new Set<string | number>(session.surface.nodes)
       const pruned: { originalSeq: number; replacementSeq: number; charsBefore: number; charsAfter: number; callId?: string }[] = []
@@ -337,7 +417,7 @@ export function applyPruner(ctx: Context, config: Config): void {
         const message = event.data.message
         const result = message.content[0]
         if (result?.type !== 'tool-result') continue
-        const content = pruneContent(result.content, config.thresholdChars, config.headChars, config.tailChars)
+        const content = pruneContent(result.content, config.thresholdChars, levelHead, levelTail)
         if (content === null) continue
         const charsBefore = measureContent(result.content)
         const charsAfter = measureContent(content)
