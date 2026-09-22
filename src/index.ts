@@ -218,29 +218,36 @@ export function apply(ctx: Context, config: Config): void {
         });
       };
       try {
-        // ── ⓪ 压缩在飞闸门（2026-09-22 实测缺陷）────────────────────────────
-        // 梯级读的是 projectedTokens（下次请求预计大小），而它在压缩**落地前**算、**落地后**才投递
-        // ⇒ 每次压缩后必然误报一次（实测：读到 651K/65%，而落地后真实值 95,218/10%），代价是我
-        // 会照它**再压一次**（≈1.13M tok）。压缩事务的 compaction/start 早于读数就在事件流里
-        // （region.ts:198），故「在飞即不评估」；抑制有预算，僵尸事务不会把通道永久静音
-        // （自愈语义与取舍见 inflight-gate.ts 的文件头）。
         const readEvent = agent.session.eventAt.bind(agent.session) as (seq: number) => unknown;
         const watch = watchCompaction(readEvent, agent.session.seq);
-        const gated = gateLadder(inflightGate, agent.id, watch.inFlight, Date.now(), DEFAULT_INFLIGHT_GRACE_MS);
-        inflightGate = gated.gate;
-        if (gated.suppressed) return;
 
-        // ── ① 压缩成功后**重新武装**梯级（同一次压缩只清一次）────────────────
+        // ── ① 压缩成功后**重新武装**梯级（同一次压缩只清一次 · 先算、后应用）──────
         // 压缩是用量**合法回落**的唯一原因：此刻必须清掉已报档位，否则压缩一次就少 30 个点灵敏度
         // （实测：落盘 warnedStep=65、真实用量 10% ⇒ 下一次插话要等到 80%）。清档按 `compaction/end`
         // seq 去重并**落盘**——否则每个 turn/end 都清 = 梯级永不生效（反向刷屏）。
         // 失败结束（带 error）不清：上下文没缩小，档位继续有效。
-        if (!watch.inFlight && watch.failure === null && watch.endSeq !== null
-          && shouldRearm(reminderState, agent.id, watch.endSeq)) {
+        // 判据**先算**：闸门需要知道它（半边乙）；**应用**放在闸门之后——本轮即便被抑制，
+        // 武装也必须完成，下一轮才能以干净档位评估。
+        const endSeq = watch.endSeq;
+        const rearmNeeded = !watch.inFlight && watch.failure === null && endSeq !== null
+          && shouldRearm(reminderState, agent.id, endSeq);
+
+        // ── ⓪ 读数新鲜度闸门（2026-09-22 两度实测缺陷）────────────────────────
+        // 梯级读的是 projectedTokens（下次请求预计大小），而**压缩会让它作废**。两个半边：
+        //   甲·压缩**在飞**：实测读到 651K/65%，同一笔压缩 1.96s 后落地、真值 95,218/10%；
+        //   乙·压缩**刚被吸收**：实测 `rearmSeq` 前进到 23440 的**同一轮**又拿旧投影报了一次
+        //      50 档（555K），而同一分钟的 `context_health` 读 92,015/9%。
+        // 两种都会让我**照它再压一次**（≈1.13M tok 白烧）。语义与取舍见 inflight-gate.ts 文件头。
+        const gated = gateLadder(
+          inflightGate, agent.id, watch.inFlight, Date.now(), DEFAULT_INFLIGHT_GRACE_MS, rearmNeeded,
+        );
+        inflightGate = gated.gate;
+        if (rearmNeeded && endSeq !== null) {
           reminderState = withoutWarnedStep(reminderState, agent.id);
-          reminderState = withRearmed(reminderState, agent.id, watch.endSeq);
+          reminderState = withRearmed(reminderState, agent.id, endSeq);
           persistReminderState();
         }
+        if (gated.suppressed) return;
 
         const report = buildReport(ctx.tokenMeter, ctx.sessionProjections, agent.session);
         const tokens = report.projectedTokens ?? report.totalTokens;

@@ -16,6 +16,7 @@ import {
   EMPTY_INFLIGHT_GATE,
   gateLadder,
 } from '../lib/inflight-gate.js';
+import { nextWarnStep } from '../lib/reminder-state.js';
 
 const AGENT = 'session-005ddf46-13b3-4b73-9779-269daadaf57b';
 /** 现场时刻：梯级读数那一刻（ms）。 */
@@ -79,4 +80,59 @@ test('按 agent 分键：一个会话压缩在飞，别的会话照常评估', (
   const gated = gateLadder(EMPTY_INFLIGHT_GATE, AGENT, true, T_WARN);
   assert.equal(gateLadder(gated.gate, other, false, T_WARN).suppressed, false, '别的会话不得被牵连');
   assert.equal(gated.gate.sinceByAgent[other], undefined);
+});
+
+// ── 半边乙：压缩**刚被吸收**（2026-09-22 二测，现场态非构造）────────────────────
+
+/**
+ * 现场读数：陈旧投影（压缩前那一笔请求）。
+ * 取值由**线上插话原话反解**：「已用 55%（约 555K / 1000K）」⇒ `round(ratio*100)=55`
+ * 且 `(tokens/1000).toFixed(0)="555"` ⇒ tokens ∈ [554.5K, 555K)。取 554,800 同时满足两者。
+ */
+const T_STALE_TOKENS = 554_800;
+/** 现场真值：同一分钟的 `context_health` 现算（压缩后 9%）。 */
+const T_TRUE_TOKENS = 92_015;
+/** 现场窗口容量。 */
+const T_WINDOW = 1_000_000;
+/** 现场档位表（`config.warnAtPercents`）。 */
+const T_PERCENTS = [50, 65, 80, 90];
+
+test('★ 尸体样本（二测）：本轮刚重新武装 ⇒ 抑制，且**抑制掉的正是会开火的那一档**', () => {
+  // 现场：`rearmSeqByAgent` 由 22054 前进到 23440（步①清了档），紧接着**同一轮**又报了一次 50 档。
+  // 两段合起来才构成证据：① 陈旧读数确实会开火；② 闸门确实把它按住了。
+  const wouldFire = nextWarnStep(T_PERCENTS, T_STALE_TOKENS, T_WINDOW, 0);
+  assert.deepEqual(wouldFire, { step: 50, percent: 55 },
+    '陈旧读数（约 555K/1M，已清档）本来会开火——这就是被抑制掉的那一枪（与线上插话原话同值）');
+
+  const gated = gateLadder(EMPTY_INFLIGHT_GATE, AGENT, false, T_WARN, DEFAULT_INFLIGHT_GRACE_MS, true);
+  assert.equal(gated.suppressed, true, '刚吸收压缩 ⇒ 投影尚未刷新 ⇒ 不得评估');
+  assert.equal(gated.reason, 'post-compaction');
+});
+
+test('★ 对照组：同一读数、同样已清档，但**本轮没武装** ⇒ 必须放行（否则半边乙会永久静音）', () => {
+  const gated = gateLadder(EMPTY_INFLIGHT_GATE, AGENT, false, T_WARN, DEFAULT_INFLIGHT_GRACE_MS, false);
+  assert.equal(gated.suppressed, false, '没吸收压缩 ⇒ 读数是新鲜的，照常评估');
+  assert.equal(gated.reason, null);
+});
+
+test('半边乙**恰抑制一轮**（自愈，无需预算）：下一轮即放行', () => {
+  const first = gateLadder(EMPTY_INFLIGHT_GATE, AGENT, false, T_WARN, DEFAULT_INFLIGHT_GRACE_MS, true);
+  assert.equal(first.suppressed, true);
+  // 下一轮的请求已挟带压缩后的表层 ⇒ buildReport 随之新鲜（现场：92,015 = 9%）
+  const next = gateLadder(first.gate, AGENT, false, T_WARN + 1_000, DEFAULT_INFLIGHT_GRACE_MS, false);
+  assert.equal(next.suppressed, false);
+  assert.deepEqual(nextWarnStep(T_PERCENTS, T_TRUE_TOKENS, T_WINDOW, 0), null,
+    '真值 92,015 ⇒ 连最低档都不该报（这正是陈旧读数与真值的分野）');
+});
+
+test('半边乙**不动闸门状态**（无状态 ⇒ 零 churn：抑制一轮不得产生写盘或状态漂移）', () => {
+  const gated = gateLadder(EMPTY_INFLIGHT_GATE, AGENT, false, T_WARN, DEFAULT_INFLIGHT_GRACE_MS, true);
+  assert.equal(gated.gate, EMPTY_INFLIGHT_GATE, '乙是纯判据，不得改闸门对象');
+});
+
+test('两半同现（人为构造）⇒ 归因到「在飞」：先失效的那个原因优先', () => {
+  const gated = gateLadder(EMPTY_INFLIGHT_GATE, AGENT, true, T_WARN, DEFAULT_INFLIGHT_GRACE_MS, true);
+  assert.equal(gated.suppressed, true);
+  assert.equal(gated.reason, 'inflight', '在飞是更强的失效源（读数此刻已被取代，且要计龄）');
+  assert.equal(gated.gate.sinceByAgent[AGENT], T_WARN, '在飞仍要起计龄（僵尸预算才不会漏）');
 });
