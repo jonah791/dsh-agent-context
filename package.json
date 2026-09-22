@@ -1,6 +1,6 @@
 {
   "name": "dsh-agent-context",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "上下文治理一体化插件：/context 命令 + ctx.contextMeter 服务 + 剪枝工具（prune_candidates/apply/expand/guard/stats）+ 两条提醒通道（上下文提醒 / 压缩告警，状态落盘跨重启去重）",
   "type": "module",
   "main": "lib/index.js",
