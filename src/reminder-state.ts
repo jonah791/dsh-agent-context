@@ -26,6 +26,16 @@ export interface ReminderState {
    * 语义：数值 ＝ 该 agent 已经报过的最高档（如 50 档意味着 50% 报过、65% 未报）。
    */
   readonly warnedStepByAgent: Record<string, number>
+  /**
+   * 已为哪个 `compaction/end` seq 做过**梯级重新武装**（2026-09-22 实测缺陷）。
+   * 语义：数值 ＝ 已处理过的 end seq；`<= 上次记录` ⇒ 不再重复清档。
+   *
+   * 为什么需要它：压缩是**用量合法回落**的唯一原因，此时梯级必须从最低档重来——否则压缩一次
+   * 就少 30 个点灵敏度（实测：压缩落地后用量 10%，而 `warnedStepByAgent` 仍记着 65 ⇒ 下一次
+   * 插话要等到 80%，刚修好的「早感知」自废）。而「每个 end seq 只清一次」必须落盘：否则每个
+   * turn/end 都清档 = 梯级永不生效（反向刷屏）。
+   */
+  readonly rearmSeqByAgent: Record<string, number>
 }
 
 /** 空状态（未授权/文件缺失/文件损坏一律回落到它）。 */
@@ -33,6 +43,7 @@ export const EMPTY_REMINDER_STATE: ReminderState = Object.freeze({
   failureSeqByAgent: {},
   warnedAtByAgent: {},
   warnedStepByAgent: {},
+  rearmSeqByAgent: {},
 })
 
 /** 只保留字符串键 → 有限数字值的记录（其余一律丢弃）。 */
@@ -53,11 +64,17 @@ function numberRecord(value: unknown): Record<string, number> {
  */
 export function parseReminderState(raw: unknown): ReminderState {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return EMPTY_REMINDER_STATE
-  const record = raw as { failureSeqByAgent?: unknown; warnedAtByAgent?: unknown; warnedStepByAgent?: unknown }
+  const record = raw as {
+    failureSeqByAgent?: unknown
+    warnedAtByAgent?: unknown
+    warnedStepByAgent?: unknown
+    rearmSeqByAgent?: unknown
+  }
   return {
     failureSeqByAgent: numberRecord(record.failureSeqByAgent),
     warnedAtByAgent: numberRecord(record.warnedAtByAgent),
     warnedStepByAgent: numberRecord(record.warnedStepByAgent),
+    rearmSeqByAgent: numberRecord(record.rearmSeqByAgent),
   }
 }
 
@@ -71,6 +88,7 @@ export function serializeReminderState(state: ReminderState): string {
     failureSeqByAgent: state.failureSeqByAgent,
     warnedAtByAgent: state.warnedAtByAgent,
     warnedStepByAgent: state.warnedStepByAgent,
+    rearmSeqByAgent: state.rearmSeqByAgent,
   })
 }
 
@@ -105,11 +123,50 @@ export function nextWarnStep(
   return { step: hit, percent: Math.round(ratio * 100) }
 }
 
-/** 记录一次梯级插话（不可变更新）。 */
+/** 记录一次梯级插话（不可变更新，只升不降）。 */
 export function withWarnedStep(state: ReminderState, agentId: string, step: number): ReminderState {
   const prev = state.warnedStepByAgent[agentId] ?? 0
   if (step <= prev) return state
   return { ...state, warnedStepByAgent: { ...state.warnedStepByAgent, [agentId]: step } }
+}
+
+/**
+ * **清空已报档位**——压缩成功后的「重新武装」（2026-09-22 实测缺陷）。
+ *
+ * 现场：压缩落地后真实占用 10%（`context_health` 现算 95,218/1,000,000），而 `warnedStepByAgent`
+ * 仍记着 65 ⇒ 梯级要等到 80% 才会再开口，而 80%（800K）早已越过「早感知」的初衷。
+ * 压缩是用量合法回落的唯一原因，故此刻清档 → 下一轮从最低档重新武装。
+ *
+ * @param state - 当前状态
+ * @param agentId - 目标 agent
+ * @returns 已清（或本就为空）⇒ 新状态；无记录 ⇒ **原对象**（幂等，避免无谓写盘）
+ */
+export function withoutWarnedStep(state: ReminderState, agentId: string): ReminderState {
+  if (state.warnedStepByAgent[agentId] === undefined) return state
+  const next = { ...state.warnedStepByAgent }
+  delete next[agentId]
+  return { ...state, warnedStepByAgent: next }
+}
+
+/**
+ * 是否该为这次 `compaction/end` 做重新武装。
+ *
+ * 判据：该 agent 已处理过的 end seq **小于**本次 seq（跨重启有效）。
+ * @param state - 已加载的状态
+ * @param agentId - 目标 agent
+ * @param endSeq - 本次成功压缩的 `compaction/end` seq
+ * @returns 该清档 → true
+ */
+export function shouldRearm(state: ReminderState, agentId: string, endSeq: number): boolean {
+  const last = state.rearmSeqByAgent[agentId]
+  return last === undefined || last < endSeq
+}
+
+/** 记录一次重新武装（不可变更新，只升不降）。 */
+export function withRearmed(state: ReminderState, agentId: string, endSeq: number): ReminderState {
+  const prev = state.rearmSeqByAgent[agentId]
+  if (prev !== undefined && prev >= endSeq) return state
+  return { ...state, rearmSeqByAgent: { ...state.rearmSeqByAgent, [agentId]: endSeq } }
 }
 
 /**

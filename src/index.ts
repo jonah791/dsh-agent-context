@@ -29,6 +29,9 @@ import { formatReportText } from './format.js';
 import { applyPruner, Config as PrunerConfigSchema } from './pruner.ts';
 // 2026-09-11 预防缺口修复：把已躺在事件流里的压缩失败浮出水面（durable ≠ visible）
 import { watchCompaction } from './compaction-watch.ts';
+// 2026-09-22：梯级读数在压缩落地前算、落地后才投递（实测差 1.96s）⇒ 算之前先过「在飞」闸门
+import { DEFAULT_INFLIGHT_GRACE_MS, EMPTY_INFLIGHT_GATE, gateLadder } from './inflight-gate.ts';
+import type { InflightGate } from './inflight-gate.ts';
 // 2026-09-14：提醒状态落盘（治「重启即失忆 → 同一笔旧失败反复播报」）
 import { readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -43,6 +46,9 @@ import {
   withWarned,
   nextWarnStep,
   withWarnedStep,
+  withoutWarnedStep,
+  shouldRearm,
+  withRearmed,
   withoutFailure,
 } from './reminder-state.ts';
 
@@ -181,6 +187,8 @@ export function apply(ctx: Context, config: Config): void {
       writeFileSync(statePath, serializeReminderState(reminderState), 'utf8')
     } catch { /* 写失败不阻塞 */ }
   }
+  /** 梯级插话的「压缩在飞」抑制状态。内存计龄：重启归零是**正确**语义（跨重启的事务不可能还在飞）。 */
+  let inflightGate: InflightGate = EMPTY_INFLIGHT_GATE;
   if (config.warnThreshold > 0 || config.warnAtPercents.length > 0) {
     // 2026-09-05 修复：触发时机从 agent/status(idle) 改为 session/event(turn/end)——原实现
     // 依赖 agent 状态转换（idle→running→idle），守护重启恢复的会话/长时间 running 的会话
@@ -210,6 +218,30 @@ export function apply(ctx: Context, config: Config): void {
         });
       };
       try {
+        // ── ⓪ 压缩在飞闸门（2026-09-22 实测缺陷）────────────────────────────
+        // 梯级读的是 projectedTokens（下次请求预计大小），而它在压缩**落地前**算、**落地后**才投递
+        // ⇒ 每次压缩后必然误报一次（实测：读到 651K/65%，而落地后真实值 95,218/10%），代价是我
+        // 会照它**再压一次**（≈1.13M tok）。压缩事务的 compaction/start 早于读数就在事件流里
+        // （region.ts:198），故「在飞即不评估」；抑制有预算，僵尸事务不会把通道永久静音
+        // （自愈语义与取舍见 inflight-gate.ts 的文件头）。
+        const readEvent = agent.session.eventAt.bind(agent.session) as (seq: number) => unknown;
+        const watch = watchCompaction(readEvent, agent.session.seq);
+        const gated = gateLadder(inflightGate, agent.id, watch.inFlight, Date.now(), DEFAULT_INFLIGHT_GRACE_MS);
+        inflightGate = gated.gate;
+        if (gated.suppressed) return;
+
+        // ── ① 压缩成功后**重新武装**梯级（同一次压缩只清一次）────────────────
+        // 压缩是用量**合法回落**的唯一原因：此刻必须清掉已报档位，否则压缩一次就少 30 个点灵敏度
+        // （实测：落盘 warnedStep=65、真实用量 10% ⇒ 下一次插话要等到 80%）。清档按 `compaction/end`
+        // seq 去重并**落盘**——否则每个 turn/end 都清 = 梯级永不生效（反向刷屏）。
+        // 失败结束（带 error）不清：上下文没缩小，档位继续有效。
+        if (!watch.inFlight && watch.failure === null && watch.endSeq !== null
+          && shouldRearm(reminderState, agent.id, watch.endSeq)) {
+          reminderState = withoutWarnedStep(reminderState, agent.id);
+          reminderState = withRearmed(reminderState, agent.id, watch.endSeq);
+          persistReminderState();
+        }
+
         const report = buildReport(ctx.tokenMeter, ctx.sessionProjections, agent.session);
         const tokens = report.projectedTokens ?? report.totalTokens;
 

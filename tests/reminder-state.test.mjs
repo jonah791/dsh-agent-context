@@ -16,11 +16,14 @@ import {
   reminderStatePath,
   serializeReminderState,
   shouldNotifyFailure,
+  shouldRearm,
   shouldWarn,
   withFailureNotified,
+  withRearmed,
   withWarned,
   withWarnedStep,
   withoutFailure,
+  withoutWarnedStep,
 } from '../lib/reminder-state.js';
 
 const SESSION = 'session-879c4ae1-b33e-43de-91d3-a968a6af6f2c';
@@ -140,4 +143,47 @@ test('新字段进序列化往返；**旧状态文件（无该字段）读回来
   const legacy = parseReminderState({ failureSeqByAgent: {}, warnedAtByAgent: { [SESSION]: 1 } });
   assert.deepEqual(legacy.warnedStepByAgent, {}, '旧文件缺字段 ⇒ 空记录（fail-safe）');
   assert.equal(legacy.warnedAtByAgent[SESSION], 1, '旧字段照常读出来');
+});
+
+// ── 2026-09-22 压缩后**重新武装**（同一次实测暴露的第二处缺陷）──────────────
+// 现场：压缩落地后真实占用 10%（现算 95,218/1,000,000），而落盘状态 warnedStepByAgent 仍记着 65
+// ⇒ 梯级要等到 80% 才会再开口，而 80%（800K）早已越过「早感知」的初衷。
+
+test('★ 现场复刻：压缩后用量回落 ⇒ 必须重新武装，否则要等到 80% 才有感知', () => {
+  // 压缩前：已报过 50 与 65 两档（落盘实测 warnedStepByAgent[SESSION] = 65）
+  const afterWarn = withWarnedStep(withWarnedStep(EMPTY_REMINDER_STATE, SESSION, 50), SESSION, 65);
+  assert.equal(afterWarn.warnedStepByAgent[SESSION], 65, '前置：压缩前已报到 65 档');
+
+  const rearmed = withoutWarnedStep(afterWarn, SESSION);
+  assert.equal(rearmed.warnedStepByAgent[SESSION], undefined, '压缩后必须清档');
+
+  // 压缩后用量重新爬回 51% ⇒ 必须**再次**插话
+  const lastStep = rearmed.warnedStepByAgent[SESSION] ?? 0;
+  assert.deepEqual(
+    nextWarnStep(LADDER, 510_000, WINDOW, lastStep),
+    { step: 50, percent: 51 },
+    '清档后 51% 必须能报',
+  );
+  // 对照组：不清档（= 修复前的行为）时，同一读数什么也不报 ⇒ 证明这条修复有区分力
+  assert.equal(nextWarnStep(LADDER, 510_000, WINDOW, 65), null, '不清档 ⇒ 51% 沉默（旧缺陷形状）');
+});
+
+test('重新武装的幂等与去重：无记录返回同一对象；同一 end seq 只清一次', () => {
+  assert.equal(withoutWarnedStep(EMPTY_REMINDER_STATE, SESSION), EMPTY_REMINDER_STATE, '无记录 ⇒ 原对象');
+
+  const endSeq = 22_100;
+  assert.equal(shouldRearm(EMPTY_REMINDER_STATE, SESSION, endSeq), true, '首次必须清');
+  const marked = withRearmed(EMPTY_REMINDER_STATE, SESSION, endSeq);
+  assert.equal(shouldRearm(marked, SESSION, endSeq), false, '同一 end seq 不得重复清（否则每轮都清=梯级永不生效）');
+  assert.equal(shouldRearm(marked, SESSION, endSeq + 1), true, '更新的压缩仍须清');
+  assert.equal(withRearmed(marked, SESSION, endSeq), marked, '回退 seq 必须 no-op（返回同一对象）');
+  assert.equal(EMPTY_REMINDER_STATE.rearmSeqByAgent[SESSION], undefined, '原状态不得被改');
+});
+
+test('新字段 rearmSeqByAgent 进序列化往返；旧状态文件缺该字段 ⇒ 空记录，不炸', () => {
+  const state = withRearmed(withWarnedStep(EMPTY_REMINDER_STATE, SESSION, 65), SESSION, 22_100);
+  assert.deepEqual(parseReminderState(JSON.parse(serializeReminderState(state))), state);
+  const legacy = parseReminderState({ warnedStepByAgent: { [SESSION]: 65 } });
+  assert.deepEqual(legacy.rearmSeqByAgent, {}, '旧文件缺字段 ⇒ 空记录（fail-safe）');
+  assert.equal(legacy.warnedStepByAgent[SESSION], 65, '旧字段照常读出来');
 });
