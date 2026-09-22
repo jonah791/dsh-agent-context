@@ -2,7 +2,7 @@
 
 > 版本 v0.2.3 · 2026-09-14 · 作者：爱丽丝 · 状态：**已实现**
 > 开发方式：语义文档优先（先写清「是什么/什么关系/怎么裁决」，再让实现逼近，最后用实践回修）
-> 实现落点：`self-plugins/dsh-agent-context/src/{index,compaction-watch,pruner,format}.ts`
+> 实现落点：`self-plugins/dsh-agent-context/src/{index,compaction-watch,pruner,prune-plan,format}.ts`
 > 语义主副本：本文；压缩事务侧契约见 `self-plugins/dsh-agent-compact/docs/semantic.md`（互相指认）
 
 ---
@@ -58,12 +58,18 @@ session/event(turn/end)  ← 每轮必发，不依赖状态转换（§5.12）
 ### 4.1 服务 / 命令 / 工具
 - 服务：`ctx.contextMeter`（`ContextMeter extends Service`，`report(session) → ContextReport`：占用/构成/健康）
 - 命令：`/context`（无参数；打印占用与花费）
-- 工具：`prune_candidates`（只读候选 + 剪后缓存代价）、`prune_apply`（按 seq 剪）、`expand`（按 callId 豁免折叠）、`prune_guard`（入口守卫开关/状态）、`prune_stats`（剪枝统计 + 缓存命中率）
-- 配置：`warnThreshold`(500000) / `warnCooldownMs`(3600000) / `pruner{thresholdChars,headChars,tailChars,guardEnabled,guardThresholdChars,guardHeadChars,guardTailChars}`
+- 工具：`prune_candidates`（只读候选 + 剪后缓存代价；**2026-09-20 起**每个候选另带 `flags` 内容指纹 / `levels` 三档字符账 / `suggest` 建议档位）、`prune_apply`（按 seq 剪；**`level` 参数** = `L1-head-tail`（缺省，等价旧行为）/ `L2-heavy` / `L3-note-only`）、`expand`（按 callId 豁免折叠）、`prune_guard`（入口守卫开关/状态）、`prune_stats`（剪枝统计 + 缓存命中率）
+- 配置：`warnThreshold`(500000) / `warnCooldownMs`(3600000) / `pruner{thresholdChars,headChars,tailChars,guardEnabled,guardThresholdChars,guardHeadChars,guardTailChars}`。⚠ 2026-09-22 复核：`pruner.headChars/tailChars` 自 2026-09-20 起**不再参与 `prune_apply` 的预算**（改由 `PRUNE_LEVELS[level]` 决定，`src/pruner.ts:405`）；两者缺省值恰与 L1 相同（4096/1024）故缺省行为不变，但**非默认配置值会被静默忽略** —— 已登记 §10 U4
 
 ### 4.2 裁决（纯函数优先）
 - `watchCompaction(read, fromSeq, lookback=400) → {failure, endSeq, inFlight}`：一次扫描同时给「最近已结束的结论」与「是否在飞行」
 - `latestCompactionFailure(read, fromSeq, lookback) → {seq, error}|null`：`watchCompaction().failure` 的薄包装（语义：最近一次已结束的压缩失败才算失败；旧错误不报）
+- **剪枝档位（`src/prune-plan.ts`，纯函数，2026-09-20 移植自 `tamaratran/fast-jev-compaction`）**：
+  - `PRUNE_LEVELS`：L1 = 头 4096 + 尾 1024（= 插件旧默认，向后兼容锚点）· L2 = 头 1024 + 尾 256 · L3 = 头尾皆 0（只留一行注记，注记开销 `NOTE_OVERHEAD_CHARS`）
+  - `inspectContent(text) → ContentFlags`：内容指纹（`error` / `paths` / `unique-ids` / `commands` / `homogeneous` + `irreplaceable`）——「**重跑工具能否替代**」的**启发式代理**，不是语义判断本身
+  - `suggestLevel(flags) → PruneLevel`：不可重取信号 ⇒ L1；同质大块 ⇒ L3；其余 ⇒ L2
+  - `planLevels(totalChars) → LevelPlan[]`：三档各自的 `charsAfter` / `savedChars` / `effective`（字符账可见）
+  - 语义边界：**只给账目与信号，剪不剪、剪哪档仍归爱丽丝**——与 I1 同源（机制把信号送达，不代替决策）
 
 ### 4.3 调用点清单 `[MUST]`
 
@@ -101,12 +107,15 @@ session/event(turn/end)  ← 每轮必发，不依赖状态转换（§5.12）
 | A8 | 真实假告警事故不再复现（8102/8103 入队 → 8114/8115 迟到 → 内容过期） | 事件流 + 0.2.2 部署后无同类 | 已实测（修前复现、修后无） |
 | A9 | 剪枝可回放：剪后能从日志重建原文 | `prune_stats` + 日志 | 已实测（历史） |
 | A10 | `tests/format.test.ts` 参与回归 | `npm test` 只跑 `tests/*.test.mjs` ⇒ **该 .ts 未被执行** | **未验证（明确标注）** |
+| A11 | 重启后同一失败 seq 不再播报（事故 9088） | 单测 `同一失败 seq 跨重启不再重复播报（事故 9088）` | 已实测（单测） |
+| A12 | 三档字符账**单调**（L1 最保守 → L3 最激进）且 L1 预算 = 插件旧默认 4096+1024 | `tests/prune-plan.test.mjs`：`省下的字符逐档递增` · `L1 预算 = 4096+1024（与插件旧默认一致 —— 向后兼容的锚点）` | 已实测（**2026-09-22 复跑**：`node --test tests/prune-plan.test.mjs` → 11/11 绿） |
+| A13 | 内容指纹能读出「重跑工具能否替代」的代理信号（报错栈 / 唯一 ID / 非大块路径 ⇒ 不可重取；同质大块 ⇒ 可激进） | `tests/prune-plan.test.mjs` 的 `inspectContent` 6 例（含正反例与干净短文） | 已实测（同上，11/11）；⚠ 该 11 例覆盖 `inspectContent`(6) + `planLevels`(5)，**不含** `suggestLevel` 与「档位 → 实际剪枝结果」链路（见 §8） |
 
 ## 8 · 与实现的关系
 
-- 主实现：`src/index.ts`（两提醒通道 + 命令 + contextMeter）、`src/compaction-watch.ts`（纯判定）、`src/pruner.ts`（剪枝 + 入口守卫）、`src/format.ts`（报告格式化）
+- 主实现：`src/index.ts`（两提醒通道 + 命令 + contextMeter）、`src/compaction-watch.ts`（纯判定）、`src/pruner.ts`（剪枝 + 入口守卫）、`src/prune-plan.ts`（纯函数：档位预算 / 三档字符账 / 内容指纹）、`src/reminder-state.ts`（提醒状态持久化的纯函数）、`src/format.ts`（报告格式化）
 - 同语义副本：无；压缩事务侧（消费方）见 `dsh-agent-compact/docs/semantic.md`
-- 未实现/未验证部分**显式标注**：① A10（`format.test.ts` 未被 test 脚本收集）② 提醒通道**无落盘存活证据**（§5.12 §3 建议的 notifiedCount 只存在内存）③ 提醒文本未做长度上限（超长上下文数字正常，但无截断保护）
+- 未实现/未验证部分**显式标注**（2026-09-22 复核修正 ②）：① A10（`format.test.ts` 未被 test 脚本收集）② ~~提醒通道**无落盘存活证据**~~ ⇒ **已部分落盘**：v0.2.3 起 `<DSH_HOME>/context-reminder-state.json` 持久化 `failureSeqByAgent`（失败去重）与 `warnedAtByAgent`（**上下文提醒的最后投递时刻**）——落盘实证：该文件 2026-09-22 12:04 仍在写（`{"failureSeqByAgent":{},"warnedAtByAgent":{…4 个会话…}}`）。**仍未落盘**：投递**计数**（`notifiedCount`）与**压缩告警**的投递时刻（见 §10 U3）③ 提醒文本未做长度上限（超长上下文数字正常，但无截断保护）④ **`suggestLevel` 与「档位 → 实际剪枝结果」链路无单测**：`tests/prune-plan.test.mjs` 11 例只覆盖纯层 `inspectContent`(6) + `planLevels`(5)，`prune_apply` 的 `level` 装配（`src/pruner.ts:405`）与 `suggestLevel` 只经线上工具面在用、**未验收** ⑤ `pruner.headChars/tailChars` 自 2026-09-20 起为**死字段**（见 §10 U4）
 
 ## 9 · 实践修订记录
 
@@ -123,9 +132,15 @@ session/event(turn/end)  ← 每轮必发，不依赖状态转换（§5.12）
   - 语义**被补充**：两条通道的去重/冷却原本**只在内存**（`warnedAt` / `notifiedFailureSeq` 两个 Map）⇒ 每次 web 重启把**同一笔旧失败**再播报一次（实测 `compaction/end` seq=9088 的告警在 09:32:45 重启后重复投递 = 狼来了），冷却也归零。这是 §5.12 §3「提醒类机制要有存活证据」的**镜像条款**：那条治「该报没报」，这条治「报过的又报」——同根 = **状态只在内存 = 重启即失忆**。
   - 语义**被补充**：新增 `src/reminder-state.ts`（纯函数）与 `<DSH_HOME>/context-reminder-state.json`；**投递前先落盘**（顺序与「至多一次」同款）；fail-safe 方向 = 坏数据回落空状态。
   - 新增可证伪验收（A11）：**重启后同一失败 seq 不再播报**——单测「同一失败 seq 跨重启不再重复播报（事故 9088）」；线上验收 = 下一次重启后不再出现 9088 那条告警（本次部署时已把 9088 预写进状态文件，避免新代码首轮再喊一次）。
+- **2026-09-22 复核回写（由 `semantic_check` 的 D3「实现比文档新」触发；触发源 `src/pruner.ts` mtime）**
+  - 语义**被补充（文档滞后于实现）**：2026-09-20 移植 `fast-jev-compaction` 的**渐进降级**落到剪枝面——`prune_candidates` 每个候选新增 `flags`（内容指纹）/ `levels`（三档字符账）/ `suggest`（建议档位），`prune_apply` 新增 `level` 参数（缺省 L1 = 旧行为）。原文 §4.1 的工具契约与 §8 实现清单**都还是 09-14 的旧样子**（只在 `prune_candidates` 写「只读候选 + 剪后缓存代价」）。已回写 §4.1 / §4.2 / §8，并补验收 A12/A13。
+  - 判据**被加强**：A12/A13 的证据是**我复跑的**离线单测（`node --test tests/prune-plan.test.mjs` → 11/11 绿、`tests/reminder-state.test.mjs` → 7/7 绿），不是「实现声称如此」。同时**如实标注没覆盖的部分**：`suggestLevel` 与 `prune_apply` 的 level 装配无单测（§8 ④）——**已实现 ≠ 已验收**。
+  - 语义**被修正（文档与自己的上一次修订矛盾）**：§8 ② 与 §10 U3 写「提醒通道**无落盘存活证据**（notifiedCount 只存在内存）」，可 v0.2.3（**同一次修订**）已经把状态落盘到 `<DSH_HOME>/context-reminder-state.json` ⇒ 同一个文件里前面说「已落盘」、后面说「只存在内存」。**教训：新增机制的同一提交里，要把所有「否定性断言」逐个找出来改**——`§9 修订记录` 写了新增，`§8/§10` 却还留着旧结论（与 `session-eject` 2026-09-22 那次同型：提交时间在后 ≠ 内容已吸收）。
+  - 发现**新缺口（未修源码，只登记）**：`config.pruner.headChars/tailChars` 在 level 化后被绕过 ⇒ **静默失效的配置字段**（§10 U4）。此类「配置看起来还在、其实不再被读」的漂移，正是本源语义文档该管的东西。
 
 ## 10 · 未决问题
 
 - **U1** 提醒是否该带**可执行动作**（如"要不要我压"）——倾向：不带，保持只送达（§2.1）
 - **U2** 上下文提醒阈值（500k）与直触压缩阈值（`.dsh/compact-direct-policy.json`）是否应同源，避免"提醒了但没人压"或"压了但没提醒"
-- **U3** 两条提醒通道需要落盘存活证据（`notifiedCount` / 最后投递时间），否则静默失效只能靠事后取证发现（§5.12 §3）
+- **U3** 两条提醒通道需要落盘存活证据（`notifiedCount` / 最后投递时间），否则静默失效只能靠事后取证发现（§5.12 §3）——**2026-09-22 复核：部分结案**。已落盘：失败去重 seq（`failureSeqByAgent`）+ 上下文提醒的最后投递时刻（`warnedAtByAgent`）。**仍未落盘**：① 投递**计数**（`notifiedCount`——「这条通道一共报过几次」仍不可从外部读出）② **压缩告警**的投递时刻（只有 seq，没有 atMs）③ 投递**失败**的证据（I6 静默吞错 ⇒ 发送失败与「判据不成立」在外部不可区分）
+- **U4**（2026-09-22 复核新增）`config.pruner.headChars/tailChars` 在 2026-09-20 level 化后**被静默绕过**（`prune_apply` 只读 `PRUNE_LEVELS[level]`）：保留（兼容旧配置、但值是死字段）还是映射成自定义档位、或从 schema 里删掉？倾向**保留 schema 但改注释 + 在 `prune_candidates` 输出里显式带上实际生效的 head/tail**（让「配置没生效」看得见，而不是靠读源码才知）
