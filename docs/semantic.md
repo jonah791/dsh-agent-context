@@ -1,20 +1,23 @@
-# 语义文档：上下文治理与两条提醒通道（Context Governance & Reminders）
+# 语义文档：上下文治理与三条提醒通道（Context Governance & Reminders）
 
-> 版本 v0.2.4 · 2026-09-22（最近复核）· 作者：爱丽丝 · 状态：**已实现**
+> 版本 v0.3.0 · 2026-09-23（最近复核）· 作者：爱丽丝 · 状态：**已实现**
 > 开发方式：语义文档优先（先写清「是什么/什么关系/怎么裁决」，再让实现逼近，最后用实践回修）
-> 实现落点：`self-plugins/dsh-agent-context/src/{index,compaction-watch,inflight-gate,pruner,prune-plan,reminder-state,format}.ts`
+> 实现落点：`self-plugins/dsh-agent-context/src/{index,compaction-watch,inflight-gate,pruner,prune-plan,reminder-state,task-boundary,format}.ts`
 > 语义主副本：本文；压缩事务侧契约见 `self-plugins/dsh-agent-compact/docs/semantic.md`（互相指认）
 
 ---
 
 ## 1 · 定位与反定位
 
-**定位**：上下文治理一体化插件——① `/context` 命令 + `ctx.contextMeter` 服务（结构化占用快照）② 剪枝工具族（`prune_candidates` / `prune_apply` / `expand` / `prune_guard` / `prune_stats` + 入口守卫折叠）③ **两条提醒通道**：【上下文提醒】（越档/越阈值建议压缩）与【压缩告警】（上一次压缩失败）。
+**定位**：上下文治理一体化插件——① `/context` 命令 + `ctx.contextMeter` 服务（结构化占用快照）② 剪枝工具族（`prune_candidates` / `prune_apply` / `expand` / `prune_guard` / `prune_stats` + 入口守卫折叠）③ **三条提醒通道**：【上下文提醒】（梯级 + 绝对阈值，读**占用**）、【上下文提醒·任务边界】（读**与当前任务的相关度**）、【压缩告警】（上一次压缩失败）。
+
+**两条通道读占用、第三条读相关度**——这是 2026-09-23 主人定调的核心区分（详见 §2「任务边界」与不变量 I12）。
 
 **反定位（本文不管什么）**：
 - 不管压缩事务与捕获（→ `dsh-agent-compact`）
 - 不管压缩入口/授权/直触（→ `dsh-compact-provider`）
-- 不管**压缩提醒**（「压缩前建议先炼化」→ `dsh-agent-skill-forge`）——**两者不是一个东西**：上下文提醒讲占用，压缩提醒讲炼化时机
+- 不管**压缩提醒**（「压缩前建议先炼化」→ `dsh-agent-skill-forge`）——**两者不是一个东西**：上下文提醒讲占用/相关度，压缩提醒讲炼化时机
+- 不管 **goal 本身**（创建/编辑/完成/选举归 `@deepseek-ai/dsh-goal`）——本插件只**只读消费** `goal/change` 事件作任务边界信号
 - **不是**自动执行器：本插件只**送达信号**，压缩与否由爱丽丝裁决（§2.1）
 
 ## 2 · 术语表
@@ -22,8 +25,11 @@
 | 术语 | 含义 |
 |------|------|
 | 提醒（reminder） | 由插件投递到会话的 user 消息（source.plugin 标明出处），只告知、不执行 |
-| 上下文提醒 | **两条子通道共用同一投递口**（`interject`，2026-09-22 起「要走插话形式」）：① **梯级插话**（主）：`【上下文提醒】上下文已用 N%（约 Xk / Yk）——已跨过 N% 档。建议压缩…` ② **绝对阈值**（旧，`contextWindow` 拿不到时兜底）：`【上下文提醒】当前上下文约 Nk tokens（阈值 Mk）——建议及时压缩…` |
+| 上下文提醒 | **三条子通道共用同一投递口**（`interject`，2026-09-22 起「要走插话形式」）：① **梯级插话**（主，读**占用**）：`【上下文提醒】上下文已用 N%（约 Xk / Yk）——已跨过 N% 档。建议压缩…` ② **任务边界**（读**相关度**，2026-09-23 增）：`【上下文提醒·任务边界】刚跨过任务边界（…）——…约 Nk（M%）是边界之前的残留…` ③ **绝对阈值**（旧，`contextWindow` 拿不到时兜底）：`【上下文提醒】当前上下文约 Nk tokens（阈值 Mk）——建议及时压缩…` |
 | 梯级插话 | 按用量**百分比档位**（`warnAtPercents`，默认 50/65/80/90）递进投递的上下文提醒；跨档即插、**每档只插一次**（去重落盘 `warnedStepByAgent`） |
+| **任务边界（task boundary）** | 会话事件流里**语义上等于「任务换了」**的 `goal/change`：`create`（新任务开始）/ `complete`（任务结束）/ `clear`（任务被清除）。**`edit` / `pause` / `resume` / `block` 不是边界**（仍是同一个任务）。信号取自框架原生事件（`@deepseek-ai/dsh-goal` 声明 `SessionEventMap['goal/change']`，且登记在 `KNOWN_SESSION_EVENT_TYPES`）——**不发明概念、不猜话题漂移、不用时间空档** |
+| **跨界残留（carry-over）** | 当前 surface 里落在**任务边界之前**的 token 量与其占比——「上一个任务留下的、还没被压掉的上下文」。这是主人判据「做前一个任务时所积攒的上下文对下个任务大多无用」的**可计算代理**：不判断语义相关性，只数「边界之前还剩多少」 |
+| 边界提醒 | `taskBoundaryHintEnabled` 为真、且**有边界 + 残留 ≥ `taskBoundaryMinTokens` + 残留占比 ≥ `taskBoundaryMinRatio` + 该边界未提醒过**时投递的上下文提醒；**每条边界只提醒一次**（去重落盘 `taskBoundarySeqByAgent`）。它存在的理由：占用维在 1M 窗口下最早开口恒为 **50%（= 50 万 = 旧阈值，两条实际重合在 500K）**，**与任务结构无关** |
 | 读数新鲜度闸门 | 梯级评估**之前**先问「这个读数是否晚于最后一次使它失效的事件」。**两个半边，缺一即误报**：甲·`compaction/start` 未配对（压缩在飞）⇒ 本轮不评估，带自愈预算（默认 180s）；乙·本轮**刚从压缩吸收回来**（`rearmSeqByAgent` 刚前进）⇒ 本轮不评估（投影要到下一笔请求才刷新，实测陈旧窗口恰一轮） |
 | 重新武装（re-arm） | 压缩**成功**（`compaction/end` 无 `error`）后清掉已报档位，使梯级从最低档重来（按 end seq 去重落盘 `rearmSeqByAgent`） |
 | 压缩告警 | `【压缩告警】上一次压缩**失败**，上下文没有缩小——<error>（compaction/end seq=N）` |
@@ -41,9 +47,15 @@ session/event(turn/end)  ← 每轮必发，不依赖状态转换（§5.12）
    │           ⇒ 本轮**不评估**（读数已被/将被压缩作废；实测甲差 1.96s、乙差一整轮）
    │      ① 压缩成功后**重新武装**：endSeq 未处理且最近一次 end 无 error ⇒ 清 warnedStep（按 seq 去重落盘）
    │           ⚠ 判据先算（闸门要它）、**应用放在闸门之后**——本轮即便被抑制，武装也必须完成
-   │      ③ 梯级：nextWarnStep(warnAtPercents, projectedTokens, contextWindow, 已报最高档)
-   │           跨档 ⇒ **先落盘**（withWarnedStep + withWarned）→ setImmediate → agent.send(text, 'next-step', true)
-   │      ④ 旧通道（窗口拿不到时兜底）：≥ warnThreshold + 冷却（shouldWarn）
+   │      ③ 梯级（**占用维**）：nextWarnStep(warnAtPercents, projectedTokens, contextWindow, 已报最高档)
+   │      ④ 任务边界（**相关度维**，2026-09-23 增）：
+   │           watchTaskBoundary(read, seq)           ← 最近一条 goal/change 的 create/complete/clear
+   │           measureCarryOver(nodes, boundarySeq, surfaceTokens)  ← Σ tokens where seq < boundarySeq
+   │           decideTaskBoundaryHint(...)            ← 有边界 ∧ 未提醒过 ∧ 残留 ≥ minTokens ∧ 占比 ≥ minRatio
+   │           ③④ **合成一条** interject（各推各的去重键，避免被盖住的那条下轮补报）
+   │           ⇒ **先落盘**（withWarnedStep / withBoundaryReminded + withWarned）
+   │              → setImmediate → agent.send(text, 'next-step', true)
+   │      ⑤ 旧通道（窗口拿不到时兜底）：≥ warnThreshold + 冷却（shouldWarn）
    └─ 通道 2【压缩告警】: 读事件流 watchCompaction(read, seq)
           ├─ inFlight=true  → 不播报（结论未定）
           ├─ failure=null   → 清除已提醒 seq（健康）
@@ -65,6 +77,9 @@ session/event(turn/end)  ← 每轮必发，不依赖状态转换（§5.12）
 9. **I9 跳过必须自愈**：在飞抑制带预算（默认 180s > 压缩自身 120s 总结超时），超预算视为**僵尸事务**（未配对的 start）⇒ **放行**——否则一条僵尸 start 会把通道永久静音（§5.10 / §5.17）
 10. **I10 压缩后重新武装**：压缩让用量**合法回落** ⇒ 清已报档位（否则压缩一次自废 30 个点灵敏度）。按 `compaction/end` seq 去重**并落盘**（否则每个 turn/end 都清 = 梯级永不生效）；**失败结束不清**（上下文没缩小）
 11. **I11 读数必须在使它失效的事件之后（刚吸收也算）**：不变量的完整形式是「**投递的读数晚于最后一次压缩**」——I8 管「压缩还在飞」，本条管「压缩**刚被吸收**（本轮 `rearmSeqByAgent` 前进）」：此刻投影**还没有被任何新请求刷新**，仍是压缩前的值。⇒ 本轮不评估（**一次即自愈**，无需预算）。**两半必须一起在**：只有 I8 时，重新武装把陈旧读数重新变成可开火状态（2026-09-22 19:39 实证：`rearmSeq` 22054→23440 的**同一轮**报出「已用 55%（约 555K）」，而同分钟 `context_health` 读 **92,015/9%**）；只有 I11 时，在飞的 1.96s 窗口照漏。**顺序纪律**：武装的**判据**先算（闸门需要它）、**应用**放在闸门之后——本轮即便被抑制，武装也必须完成，下一轮才以干净档位评估
+12. **I12 第三条通道读「相关度」而非「占用」**：任务边界通道的判据里**没有任何绝对占用阈值**——它只问「有多少 token 落在边界之前」。**这是刻意的**：一旦给它加占用下限，它就退化成第四条占用通道，主人 2026-09-23 的原判据（跨任务即该压，与总量无关）就丢了。与占用维的关系是**合成而非竞争**：两条同时命中 ⇒ 投递**一条**消息（各推各的去重键），不打扰两次。
+13. **I13 每条边界只提醒一次**：跨界残留**不会自己减少**（它一直留在 surface 里，直到某次压缩把它折进摘要）⇒ 若不去重，每个 `turn/end` 都命中同一判据 = 刷屏。去重键 = 边界 seq（事件流 seq 单调递增 ⇒ 只升不降），**必须落盘**（`taskBoundarySeqByAgent`）——否则每次重启都会对同一条旧边界再提醒一次（狼来了），与 §5.12 §3 同根。
+14. **I14 边界信号只做高精度那一档**：只认 `goal/change`，**不**引入话题漂移、时间空档、消息长度这类需要主观阈值的弱信号。理由是**代价不对称**：误报的代价是一次白压（≈百万 token），漏报的代价只是「没提早」——梯级通道照常兜底。⇒ 精度优先于召回；召回缺口如实登记为 §10 U6。
 
 ## 4 · 契约
 
@@ -72,7 +87,7 @@ session/event(turn/end)  ← 每轮必发，不依赖状态转换（§5.12）
 - 服务：`ctx.contextMeter`（`ContextMeter extends Service`，`report(session) → ContextReport`：占用/构成/健康）
 - 命令：`/context`（无参数；打印占用与花费）
 - 工具：`prune_candidates`（只读候选 + 剪后缓存代价；**2026-09-20 起**每个候选另带 `flags` 内容指纹 / `levels` 三档字符账 / `suggest` 建议档位）、`prune_apply`（按 seq 剪；**`level` 参数** = `L1-head-tail`（缺省，等价旧行为）/ `L2-heavy` / `L3-note-only`）、`expand`（按 callId 豁免折叠）、`prune_guard`（入口守卫开关/状态）、`prune_stats`（剪枝统计 + 缓存命中率）
-- 配置：`warnThreshold`(500000) / `warnCooldownMs`(3600000) / **`warnAtPercents`(`[50,65,80,90]`，2026-09-22 新增：梯级档位，升序；**空数组 = 关掉梯级只剩旧通道**；拿得到 `contextWindow` 时按它递进，拿不到则自动退回旧通道）** / `pruner{thresholdChars,headChars,tailChars,guardEnabled,guardThresholdChars,guardHeadChars,guardTailChars}`。⚠ 2026-09-22 复核：`pruner.headChars/tailChars` 自 2026-09-20 起**不再参与 `prune_apply` 的预算**（改由 `PRUNE_LEVELS[level]` 决定，`src/pruner.ts:405`）；两者缺省值恰与 L1 相同（4096/1024）故缺省行为不变，但**非默认配置值会被静默忽略** —— 已登记 §10 U4
+- 配置：`warnThreshold`(500000) / `warnCooldownMs`(3600000) / **`warnAtPercents`(`[50,65,80,90]`，2026-09-22 新增：梯级档位，升序；**空数组 = 关掉梯级只剩旧通道**；拿得到 `contextWindow` 时按它递进，拿不到则自动退回旧通道）** / **`taskBoundaryHintEnabled`(`true`，2026-09-23 新增：任务边界通道开关；关掉 ⇒ 不读事件流、不量残留，零额外开销) · `taskBoundaryMinTokens`(`30000`：残留 token 下限——低于它压了也不省，不值得打扰) · `taskBoundaryMinRatio`(`0.5`：残留占比下限——当前任务自己已占多数则不必压)** / `pruner{thresholdChars,headChars,tailChars,guardEnabled,guardThresholdChars,guardHeadChars,guardTailChars}`。⚠ 2026-09-22 复核：`pruner.headChars/tailChars` 自 2026-09-20 起**不再参与 `prune_apply` 的预算**（改由 `PRUNE_LEVELS[level]` 决定，`src/pruner.ts:405`）；两者缺省值恰与 L1 相同（4096/1024）故缺省行为不变，但**非默认配置值会被静默忽略** —— 已登记 §10 U4
 
 ### 4.2 裁决（纯函数优先）
 - `watchCompaction(read, fromSeq, lookback=400) → {failure, endSeq, inFlight}`：一次扫描同时给「最近已结束的结论」与「是否在飞行」
@@ -83,6 +98,12 @@ session/event(turn/end)  ← 每轮必发，不依赖状态转换（§5.12）
   - `shouldRearm(state, agentId, endSeq)` / `withRearmed(state, agentId, endSeq)`：按 `compaction/end` seq 去重，只升不降
   - `gateLadder(gate, agentId, inFlight, nowMs, graceMs=180_000, rearmedThisRound=false) → {gate, suppressed, reason}`：**两个失效源**——甲·`inFlight` ⇒ 抑制（不在飞则清计龄；超预算放行，僵尸识别见 I9；计龄只用**本进程墙钟**，不读事件时间字段，不猜其单位语义）；乙·`rearmedThisRound` ⇒ 抑制（见 I11；无状态，一次即自愈，无需预算）。`reason` ∈ `'inflight' | 'post-compaction' | null`（两半同现时归因到甲——更强的失效源）。无需抑制且无记录时返回**同一对象**（零 churn）
   - 全部状态落在 `<DSH_HOME>/context-reminder-state.json`（单行 JSON，人读友好；坏数据一律回落空状态）
+- **任务边界通道（`src/task-boundary.ts`，纯函数，2026-09-23）**：
+  - `watchTaskBoundary(read, fromSeq, lookback=2000) → {seq, operation, objective?}|null`：有界回溯找**最近一条**构成边界的 `goal/change`（`create` / `complete` / `clear`）；`edit` / `pause` / `resume` / `block` 跳过。**只取最近一条**——goal 变更在语义上是**替换**而非累积，按更早的边界算残留会把「上个任务 + 上上个任务」混为一谈
+  - `measureCarryOver(nodes, boundarySeq, surfaceTokens) → {tokens, ratio}`：`Σ nodes[i].tokens where nodes[i].seq < boundarySeq`；非法/负价节点跳过；`surfaceTokens<=0` 或非有限 ⇒ `ratio = 0`（不产生 NaN 污染裁决）。入参只要求结构子集 `{seq, tokens}`（`PricedNode`），**不耦合宿主类型**（`TokenMeasurement.nodes` 直接满足）
+  - `decideTaskBoundaryHint({boundary, carryOver, lastRemindedSeq, minTokens, minRatio}) → TaskBoundary|null`：四条判据全满足才投（见 I13/I14）；配置异常（NaN / ratio 越界）⇒ `null`——**fail-safe 方向是安静，不是乱报**
+  - `buildTaskBoundaryHintText({boundary, carryOver, usedTokens, contextWindow?})`：说清「跨过什么边界 / 多少是残留 / 为何此刻压最划算」——提醒给**判断依据**，不只给命令。目标文本截断到 60 字符（插话不搬运全文）
+  - 状态层新增 `taskBoundarySeqByAgent`，配 `withBoundaryReminded`（只升不降、幂等返回原对象）与 `lastRemindedBoundarySeq`（从未提醒 ⇒ `-1`）
 - **剪枝档位（`src/prune-plan.ts`，纯函数，2026-09-20 移植自 `tamaratran/fast-jev-compaction`）**：
   - `PRUNE_LEVELS`：L1 = 头 4096 + 尾 1024（= 插件旧默认，向后兼容锚点）· L2 = 头 1024 + 尾 256 · L3 = 头尾皆 0（只留一行注记，注记开销 `NOTE_OVERHEAD_CHARS`）
   - `inspectContent(text) → ContentFlags`：内容指纹（`error` / `paths` / `unique-ids` / `commands` / `homogeneous` + `irreplaceable`）——「**重跑工具能否替代**」的**启发式代理**，不是语义判断本身
@@ -97,6 +118,7 @@ session/event(turn/end)  ← 每轮必发，不依赖状态转换（§5.12）
 | 宿主事件 | `src/index.ts` `ctx.on('session/event')` ×2 | 通道 1（上下文提醒）与通道 2（压缩告警守望），均只在 `turn/end` |
 | 宿主事件 | `src/index.ts` `ctx.on('session/event')`（pruner） | 大工具结果进上下文前折叠（入口守卫） |
 | 纯模块 | `src/inflight-gate.ts` `gateLadder`（由通道 1 在**量之前**调用；第六参 = 本轮是否要重新武装） | 梯级评估前（两个半边见 I8/I11）⚠ 顺序：**武装的判据先算、应用放在闸门之后**（`src/index.ts` 的 `rearmNeeded`） |
+| 纯模块 | `src/task-boundary.ts` `watchTaskBoundary` / `measureCarryOver` / `decideTaskBoundaryHint`（由通道 1 的 ④ 调用；入参 `readEvent` = `session.eventAt` 绑定、`ctx.tokenMeter.measure(session).nodes`） | `turn/end`、且在**读数新鲜度闸门之后**——与梯级共用同一闸门，因为两者读的是同一份会被压缩作废的投影 |
 | 命令面 | `src/index.ts` `ctx.commands.register({name:'context'})` | 手动体检 |
 | 工具面 | `src/index.ts` → `applyPruner(ctx, cfg)` | 5 个剪枝工具 + 守卫 |
 
@@ -134,13 +156,18 @@ session/event(turn/end)  ← 每轮必发，不依赖状态转换（§5.12）
 | A15 | 僵尸事务（未配对 `compaction/start` 超预算）⇒ **放行**，不永久静音 | `tests/inflight-gate.test.mjs` 对照组：`超预算 ⇒ 视为僵尸，放行` + `预算常量必须长于压缩自身 120s 总结超时` | 已实测（单测，含对照组） |
 | A16 | 压缩成功后**重新武装**（清档 + 按 end seq 去重） | 单测 3 例（含反证「不清档 ⇒ 51% 沉默」）+ **线上落盘实证**：2026-09-22 17:40 读 `<DSH_HOME>/context-reminder-state.json` → `"warnedStepByAgent":{}` 且 `"rearmSeqByAgent":{"session-005ddf46…":22054}` | **已实测（线上）**；⚠ 同日 19:39 二次实证 `rearmSeqByAgent` 前进到 **23440**（＝新一笔压缩的 end seq）——**武装本身可靠**，问题在它把陈旧读数重新变为可开火（见 A17/I11） |
 | A17 | 压缩**刚被吸收**（本轮武装）⇒ 梯级**不评估**；下一轮即放行（一次即自愈） | `tests/inflight-gate.test.mjs`：**现场尸体样本**（陈旧读数 554,800/1M 确实会开火 ⇒ 闸门确实按住它；该取值由线上插话原话「55%（约 555K）」反解）+ 对照组（不武装必须放行）+ 「恰抑制一轮」+ 「不动闸门状态」 | 已实测（单测，4 例）；⚠ **线上待验收**：下一次真实压缩后不应再出现假插话。现场落盘证据：19:39 `rearmSeqByAgent:23440` 与 `warnedStepByAgent:50` **同轮**写入（＝缺陷签名） |
+| A18 | 任务边界识别正确：`create`/`complete`/`clear` 是边界，`edit`/`pause`/`resume`/`block` **不是**；取**最近一条**；超 `lookback` 不算；畸形载荷不炸 | `tests/task-boundary.test.mjs` 7 例 **＋ 真语料对账** `_tmp_review/verify-task-boundary-real-log.mjs`：读我自己会话 `session-9919ca78` 的 v4 日志（941 帧 / 1713 事件 / **17 条真实 `goal/change`**）⇒ 取到 `seq=1445 op=create`，并**正确跳过后面的 `edit`(1453)**；裁决 PASS | 已实测（单测 **＋ 真语料**，2026-09-23 00:1x） |
+| A19 | 跨界残留测量正确：只数 `seq < boundarySeq`；非法/负价节点跳过；`surfaceTokens<=0` 或非有限 ⇒ `ratio=0`（不产 NaN） | `tests/task-boundary.test.mjs` 3 例 | 已实测（单测） |
+| A20 | **主人场景**：跨任务 + 大量残留 ⇒ **即使占用仅 20%**（远低于 50% 档）也投递；对照组（无边界 / 占比不足 / 残留太小 / 配置异常）⇒ 一律不投 | `tests/task-boundary.test.mjs` 6 例（含「无边界 ⇒ 恒不投」对照组，证明判据有分辨力） | 已实测（单测）；⚠ **线上待验收**：下一次真实 `goal/change` 边界上应出现一条【上下文提醒·任务边界】，且其读数与 `context_health` 现算一致 |
+| A21 | 每条边界只提醒一次（只升不降 / 幂等）+ 新字段进序列化往返 + **旧状态文件缺该字段 ⇒ 空记录不炸** | `tests/reminder-state.test.mjs` 2 例 | 已实测（单测，2026-09-23） |
 
 ## 8 · 与实现的关系
 
-- 主实现：`src/index.ts`（两提醒通道 + 命令 + contextMeter）、`src/compaction-watch.ts`（纯判定）、`src/inflight-gate.ts`（纯判定：**读数新鲜度闸门**——在飞 + 刚吸收两个半边）、`src/pruner.ts`（剪枝 + 入口守卫）、`src/prune-plan.ts`（纯函数：档位预算 / 三档字符账 / 内容指纹）、`src/reminder-state.ts`（提醒状态持久化的纯函数）、`src/format.ts`（报告格式化）
+- 主实现：`src/index.ts`（**三条提醒通道** + 命令 + contextMeter）、`src/compaction-watch.ts`（纯判定）、`src/inflight-gate.ts`（纯判定：**读数新鲜度闸门**——在飞 + 刚吸收两个半边）、`src/task-boundary.ts`（纯判定：**任务边界识别 + 跨界残留测量 + 边界提醒裁决**，2026-09-23 增）、`src/pruner.ts`（剪枝 + 入口守卫）、`src/prune-plan.ts`（纯函数：档位预算 / 三档字符账 / 内容指纹）、`src/reminder-state.ts`（提醒状态持久化的纯函数）、`src/format.ts`（报告格式化）
 - 同语义副本：无；压缩事务侧（消费方）见 `dsh-agent-compact/docs/semantic.md`
-- 未实现/未验证部分**显式标注**（2026-09-22 复核修正 ②⑥）：① A10（`format.test.ts` 未被 test 脚本收集）② 提醒通道的**落盘存活证据**：`<DSH_HOME>/context-reminder-state.json` 持久化四个字段——`failureSeqByAgent`（失败去重 seq）/ `warnedAtByAgent`（上下文提醒的最后投递时刻）/ `warnedStepByAgent`（梯级**已报最高档**，2026-09-22 增）/ `rearmSeqByAgent`（重新武装去重 seq，2026-09-22 增）；**线上落盘实证**：该文件 2026-09-22 17:40 实测内容为 `{"failureSeqByAgent":{},"warnedAtByAgent":{…4 会话…},"warnedStepByAgent":{},"rearmSeqByAgent":{"session-005ddf46…":22054}}`，19:39 二次实证为 `"warnedStepByAgent":{…:50}` + `"rearmSeqByAgent":{…:23440}`。**仍未落盘**：投递**计数**（`notifiedCount`）与**压缩告警**的投递时刻（见 §10 U3）③ 提醒文本未做长度上限（超长上下文数字正常，但无截断保护）④ **`suggestLevel` 与「档位 → 实际剪枝结果」链路无单测**：`tests/prune-plan.test.mjs` 11 例只覆盖纯层 `inspectContent`(6) + `planLevels`(5)，`prune_apply` 的 `level` 装配（`src/pruner.ts:405`）与 `suggestLevel` 只经线上工具面在用、**未验收** ⑤ `pruner.headChars/tailChars` 自 2026-09-20 起为**死字段**（见 §10 U4）⑥ **抑制不设独立侧车计数**（2026-09-22 刻意取舍）：两个半边的证据都住在**权威源**里——甲＝事件流有无未配对的 `compaction/start`；乙＝状态文件两字段的**偏序**（`rearmSeqByAgent` 已前进而 `warnedStepByAgent` 无新增 ⇒ 本轮被抑制，正常；两者都前进 ⇒ 漏了出去，缺陷）。再记一份等于造第二个真源
-- ⚠ 测试覆盖面：`npm test` = `tests/*.test.mjs`（format 之外四个文件）；本插件单测 **53 例**（2026-09-22 复跑 53/53 绿）
+- 未实现/未验证部分**显式标注**（2026-09-22 复核修正 ②⑥）：① A10（`format.test.ts` 未被 test 脚本收集）② 提醒通道的**落盘存活证据**：`<DSH_HOME>/context-reminder-state.json` 持久化**五个**字段——`failureSeqByAgent`（失败去重 seq）/ `warnedAtByAgent`（上下文提醒的最后投递时刻）/ `warnedStepByAgent`（梯级**已报最高档**，2026-09-22 增）/ `rearmSeqByAgent`（重新武装去重 seq，2026-09-22 增）/ `taskBoundarySeqByAgent`（**任务边界去重 seq**，2026-09-23 增）；**线上落盘实证**：该文件 2026-09-22 17:40 实测内容为 `{"failureSeqByAgent":{},"warnedAtByAgent":{…4 会话…},"warnedStepByAgent":{},"rearmSeqByAgent":{"session-005ddf46…":22054}}`，19:39 二次实证为 `"warnedStepByAgent":{…:50}` + `"rearmSeqByAgent":{…:23440}`。**仍未落盘**：投递**计数**（`notifiedCount`）与**压缩告警**的投递时刻（见 §10 U3）③ 提醒文本未做长度上限（超长上下文数字正常，但无截断保护）④ **`suggestLevel` 与「档位 → 实际剪枝结果」链路无单测**：`tests/prune-plan.test.mjs` 11 例只覆盖纯层 `inspectContent`(6) + `planLevels`(5)，`prune_apply` 的 `level` 装配（`src/pruner.ts:405`）与 `suggestLevel` 只经线上工具面在用、**未验收** ⑤ `pruner.headChars/tailChars` 自 2026-09-20 起为**死字段**（见 §10 U4）⑥ **抑制不设独立侧车计数**（2026-09-22 刻意取舍）：两个半边的证据都住在**权威源**里——甲＝事件流有无未配对的 `compaction/start`；乙＝状态文件两字段的**偏序**（`rearmSeqByAgent` 已前进而 `warnedStepByAgent` 无新增 ⇒ 本轮被抑制，正常；两者都前进 ⇒ 漏了出去，缺陷）。再记一份等于造第二个真源
+- ⚠ 测试覆盖面：`npm test` = `tests/*.test.mjs`（format 之外**五个**文件：compaction-watch / inflight-gate / prune-plan / reminder-state / task-boundary）；本插件单测 **74 例**（2026-09-23 00:1x 复跑 **74/74 绿**）
+- ⚠ **任务边界通道的线上验收缺口（2026-09-23 显式登记）**：⑦ 边界提醒的**真实投递**尚无线上观测——单测与**真语料对账**（A18）分别证明了「裁决正确」与「真实载荷解析正确」，但**端到端那一跳**（真实 `turn/end` → 命中 → `interject` 落进会话）未验：本轮压缩刚落地 ⇒ 残留比已降到阈值以下，**此刻不该触发**。**升级条件**：下一次真实 `goal/change` 边界（`create` 或 `complete`）后查两处——① 会话里是否出现【上下文提醒·任务边界】② `<DSH_HOME>/context-reminder-state.json` 的 `taskBoundarySeqByAgent` 是否被写成该边界 seq。**两处皆无 = 该通道静默失效**。⑧ `watchTaskBoundary` 的 `lookback=2000` 是**估值**（按「一次会话内多次 goal 变更」估）；真语料实测本会话 17 条 `goal/change` 分布在 seq 169–1453 ⇒ 2000 够用，但**长会话跨越 2000 事件后旧边界会掉出回溯窗口**（后果：边界退化为 `null` ⇒ 通道静默；**不会误报**——fail-safe 方向正确）
 
 ## 9 · 实践修订记录
 
@@ -174,6 +201,13 @@ session/event(turn/end)  ← 每轮必发，不依赖状态转换（§5.12）
   - 语义**被补充（顺序纪律）**：武装的**判据**先算（闸门需要它）、**应用**放在闸门之后——本轮即便被抑制，武装也必须完成，下一轮才以干净档位评估。（`src/index.ts` 的 `rearmNeeded` + `gateLadder` 第六参）
   - 判据**被修正（怎么读 A 行）**：A14 的线上验收**未通过**，但并非「条件被违反」——19:39 那次闸门条件（在飞）根本不成立。⇒ **A 行的线上验收只覆盖它自己的条件**，不得读成「机制整体已上线」；一条不变量的验收通过 ≠ 邻近形状也被覆盖。
   - 教训（与五次实践同根、升一档）：**「读数有时刻」的完整形式是「读数必须晚于使它失效的事件」**——只想到失效源之一（在飞）而漏掉另一个（刚吸收），等于把误报从「必然发生」降级成「换个姿势必然发生」。**判据：写完一条抑制规则后，逐条列举「还有什么事件会让这个读数作废」**，而不是等人被误报一次。
+- **2026-09-23 七次实践（压缩提醒去死板 · 主人定调；触发源 `src/index.ts` + 新增 `src/task-boundary.ts`）**
+  - 主人判据（原话）：「现在的压缩提醒机制太死板了，定死了大于500K才压缩，但很多时候可以提早进行压缩，因为对于两个任务来说，做前一个任务时所积攒的大多数上下文是无用的，会影响下个任务的表现。」
+  - **缺口是现算的，不是印象**：`warnAtPercents` 默认首档 50%、`warnThreshold` 默认 500000 ⇒ 1M 窗口下 **50% × 1M = 500000 = 旧阈值**，两条通道**实际重合在 500K**，且都与任务结构无关。落盘实证（2026-09-23 00:02 读 `<DSH_HOME>/context-reminder-state.json`）：`warnedStepByAgent:{"session-005ddf46…":50}` —— 梯级**确实在跑**，但**最早开口就是 50 万**。
+  - 语义**被补充**：新增**第三条通道**——读**与当前任务的相关度**（可计算代理 = 跨界残留比）。**任务边界不发明概念**：用框架原生的 `goal/change`（`create`/`complete`/`clear`；`edit`/`pause`/`resume`/`block` **不是**边界）。**判据里不含任何绝对占用阈值**（I12）——一旦加了就退化成第四条占用通道，主人的原判据就丢了。
+  - 语义**被修正（通道关系：合成而非竞争）**：新通道与既有两条**同时命中 ⇒ 投递一条消息**，且**各推各的去重键**——否则被合成消息盖住的那条会在下一轮补报（双重打扰）。这是写代码时才想清的：初版打算「命中即 return」，那会让另一条要么永远轮不到、要么重复打扰。
+  - 真语料对账（**为什么单测不够**）：单测夹具是我按官方声明手搓的，只能证明「实现与我的理解一致」，**不能证明我的理解与真实写入方一致**（载荷字段名一错，单测全绿而线上恒不触发——正是 §5.9 §2 的形状）。⇒ 补 `_tmp_review/verify-task-boundary-real-log.mjs`：用官方 `scanZstdFrames` 逐帧解我自己的 v4 日志（**941 帧 / 1713 事件 / 17 条真实 `goal/change`**），裁决 **PASS**，并实测到「取最近一条边界、且跳过后面的 `edit`(1453)」这一行为**真的发生**。
+  - 教训（**代价不对称决定精度优先**）：边界信号只做**高精度那一档**（I14）——误报代价是一次白压（≈百万 token），漏报代价只是「没提早」（梯级照常兜底）。⇒ 不引入话题漂移 / 时间空档这类需要主观阈值的弱信号；召回缺口登记为 §10 U6，**不假装它不存在**。
 
 ## 10 · 未决问题
 
@@ -182,3 +216,4 @@ session/event(turn/end)  ← 每轮必发，不依赖状态转换（§5.12）
 - **U3** 两条提醒通道需要落盘存活证据（`notifiedCount` / 最后投递时间），否则静默失效只能靠事后取证发现（§5.12 §3）——**2026-09-22 复核：部分结案**。已落盘：失败去重 seq（`failureSeqByAgent`）+ 上下文提醒的最后投递时刻（`warnedAtByAgent`）+ 梯级**已报最高档**（`warnedStepByAgent`）+ **重新武装去重 seq**（`rearmSeqByAgent`，后两者 2026-09-22 增）。**仍未落盘**：① 投递**计数**（`notifiedCount`——「这条通道一共报过几次」仍不可从外部读出）② **压缩告警**的投递时刻（只有 seq，没有 atMs）③ 投递**失败**的证据（I6 静默吞错 ⇒ 发送失败与「判据不成立」在外部不可区分）
 - **U4**（2026-09-22 复核新增）`config.pruner.headChars/tailChars` 在 2026-09-20 level 化后**被静默绕过**（`prune_apply` 只读 `PRUNE_LEVELS[level]`）：保留（兼容旧配置、但值是死字段）还是映射成自定义档位、或从 schema 里删掉？倾向**保留 schema 但改注释 + 在 `prune_candidates` 输出里显式带上实际生效的 head/tail**（让「配置没生效」看得见，而不是靠读源码才知）
 - **U5**（2026-09-22 五次实践新增，六次实践扩展）梯级通道的**抑制**（I8/I11）与**重新武装**（I10）目前只在**内存/单测**层面被验；线上尚无「一次真实的压缩后**被抑制**、下一次压缩后**重新武装**」的完整观测记录（A14 的线上验收已于 19:39 **未通过**、A17 标「线上待验收」）。要不要给通道 1 也加一条**投递/抑制的 atMs 轨迹**？（与 U3 ③ 同根，但**刻意与「不造第二真源」的取舍冲突** ⇒ 先记录，不急着做）。**六次实践给出的临时答案**：状态文件两字段的**偏序**已经够读（§8 ⑥）——`rearmSeq` 前进而 `warnedStep` 无新增 ⇒ 本轮被抑制（正常）；两者都前进 ⇒ 漏了出去（缺陷）。**升级条件**：若再出现一次「两者都前进」的漏报，说明该偏序读法不足，届时才引入显式轨迹
+- **U6**（2026-09-23 七次实践新增）任务边界通道的**召回缺口**：不建 goal 的会话（短任务 / 闲聊 / 一次性问答）拿不到边界提醒——而主人的原判据（「做前一个任务时所积攒的上下文对下个任务无用」）在这些场景**同样成立**。候选补法：① 一条**显式声明**原语（由主体标记「新任务开始」）② 更弱的自动信号（`session/title` 变更 / 长空档后恢复 / `todo_write` 列表整体换血）——**每条都要先付精度代价的账**（弱信号都可能换来一次白压）。**倾向**：先只跑高精度那一档，用 `taskBoundarySeqByAgent` 的落盘频率观察真实召回够不够；不够再上**显式声明原语**（声明由主体做出 ⇒ 不引入误报，符合 §2.1「机制把信号送达，不代替决策」）

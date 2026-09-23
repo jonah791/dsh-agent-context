@@ -199,8 +199,8 @@ export function applyPruner(ctx: Context, config: Config): void {
       if (event?.type !== 'tool/result') continue
       const message = event.data?.message
       if (message === undefined) continue
-      const result = message.content[0]
-      const blocks = result?.type === 'tool-result' ? result.content : undefined
+      // 0.1.7：tool/result 的块已上提到 message.content 顶层，v3 的 `{type:'tool-result'}` 包装被移除。
+      const blocks: readonly ContentBlock[] | undefined = Array.isArray(message.content) ? message.content : undefined
       const chars = blocks === undefined ? 0 : measureContent(blocks)
       const tokens = tokenBySeq.get(seq) ?? 0
       // 内容指纹 + 三档字符账（2026-09-20 移植自 fast-jev-compaction）：
@@ -415,14 +415,15 @@ export function applyPruner(ctx: Context, config: Config): void {
         const event = (session as unknown as { eventAt(seq: number): unknown }).eventAt(seq) as unknown as ToolResultEventView | undefined
         if (event?.type !== 'tool/result') continue
         const message = event.data.message
-        const result = message.content[0]
-        if (result?.type !== 'tool-result') continue
-        const content = pruneContent(result.content, config.thresholdChars, levelHead, levelTail)
+        // 0.1.7：块在 message.content 顶层（v3 的 `content[0].type==='tool-result'` 包装已移除）。
+        const blocks = message.content
+        if (!Array.isArray(blocks) || blocks.length === 0) continue
+        const content = pruneContent(blocks, config.thresholdChars, levelHead, levelTail)
         if (content === null) continue
-        const charsBefore = measureContent(result.content)
+        const charsBefore = measureContent(blocks)
         const charsAfter = measureContent(content)
         const tokensBefore = tokenMeter.estimateMessage(message)
-        const prunedMessage = freezeMessage({ ...message, content: [{ ...result, content }] })
+        const prunedMessage = freezeMessage({ ...message, content })
         // compaction/prune 与 surfaceOp replace 是官方 compaction 插件的扩展事件契约
         // （官方 SessionEventMap 不含，运行时确有；与 dsh-agent-memory 的 compaction-sink 同款收窄）
         // 注意：append 必须保持 this 绑定（内部用 this.log）——解绑会报 reading 'log'
@@ -672,13 +673,14 @@ export function applyPruner(ctx: Context, config: Config): void {
         try {
           const msg = (ev.data as { message?: Message }).message
           const callId = (msg?.source as { callId?: string } | undefined)?.callId
-          const result = msg?.content?.[0]
-          if (!guard.enabled || callId === undefined || guard.exempt.has(callId) || result?.type !== 'tool-result') return
-          const content = pruneContent(result.content, config.guardThresholdChars, config.guardHeadChars, config.guardTailChars)
+          // 0.1.7：块在 message.content 顶层（v3 的 tool-result 包装已移除）。
+          const blocks = msg?.content
+          if (!guard.enabled || callId === undefined || guard.exempt.has(callId) || !Array.isArray(blocks) || blocks.length === 0) return
+          const content = pruneContent(blocks, config.guardThresholdChars, config.guardHeadChars, config.guardTailChars)
           if (content === null) return
-          const chars = measureContent(result.content)
+          const chars = measureContent(blocks)
           const marker: ContentBlock = { type: 'text', text: guardMarker(callId, chars) }
-          const prunedMessage = freezeMessage({ ...(msg as Message), content: [{ ...result, content: [...content, marker] }] })
+          const prunedMessage = freezeMessage({ ...(msg as Message), content: [...content, marker] })
           const seq = (ev as unknown as { seq?: number }).seq
           const appendEvent = (session as unknown as { append: (t: string, d: unknown, o?: unknown) => { seq: number } }).append.bind(session)
           appendEvent('compaction/prune', {

@@ -11,6 +11,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   EMPTY_REMINDER_STATE,
+  lastRemindedBoundarySeq,
   nextWarnStep,
   parseReminderState,
   reminderStatePath,
@@ -18,6 +19,7 @@ import {
   shouldNotifyFailure,
   shouldRearm,
   shouldWarn,
+  withBoundaryReminded,
   withFailureNotified,
   withRearmed,
   withWarned,
@@ -186,4 +188,31 @@ test('新字段 rearmSeqByAgent 进序列化往返；旧状态文件缺该字段
   const legacy = parseReminderState({ warnedStepByAgent: { [SESSION]: 65 } });
   assert.deepEqual(legacy.rearmSeqByAgent, {}, '旧文件缺字段 ⇒ 空记录（fail-safe）');
   assert.equal(legacy.warnedStepByAgent[SESSION], 65, '旧字段照常读出来');
+});
+
+// ── 2026-09-23 任务边界去重（主人定调「压缩提醒太死板」）────────────────────
+// 语义：跨界残留**不会自己减少**（它会一直留在 surface 里直到被压进摘要），故同一条边界
+// 必须只提醒一次——否则每个 turn/end 都命中同一判据 = 刷屏。
+
+test('★ 任务边界去重：同一条边界只提醒一次，更新的边界仍须提醒', () => {
+  const boundarySeq = 23_950;
+  assert.equal(lastRemindedBoundarySeq(EMPTY_REMINDER_STATE, SESSION), -1, '从未提醒 ⇒ -1（任何真实 seq 都大于它）');
+
+  const marked = withBoundaryReminded(EMPTY_REMINDER_STATE, SESSION, boundarySeq);
+  assert.equal(lastRemindedBoundarySeq(marked, SESSION), boundarySeq);
+  assert.equal(withBoundaryReminded(marked, SESSION, boundarySeq), marked, '同 seq 必须 no-op（返回同一对象）');
+  assert.equal(withBoundaryReminded(marked, SESSION, boundarySeq - 1), marked, '更早的边界不得回退（只升不降）');
+  assert.equal(lastRemindedBoundarySeq(withBoundaryReminded(marked, SESSION, boundarySeq + 1), SESSION), boundarySeq + 1);
+  assert.equal(EMPTY_REMINDER_STATE.taskBoundarySeqByAgent[SESSION], undefined, '原状态不得被改');
+});
+
+test('新字段 taskBoundarySeqByAgent 进序列化往返；旧状态文件缺该字段 ⇒ 空记录，不炸', () => {
+  const state = withBoundaryReminded(withWarnedStep(EMPTY_REMINDER_STATE, SESSION, 50), SESSION, 23_950);
+  assert.deepEqual(parseReminderState(JSON.parse(serializeReminderState(state))), state);
+  // 旧文件（本字段引入前写下的）必须照常读出来，且新字段为空记录
+  const legacy = parseReminderState({ warnedStepByAgent: { [SESSION]: 50 }, rearmSeqByAgent: { [SESSION]: 22_100 } });
+  assert.deepEqual(legacy.taskBoundarySeqByAgent, {}, '旧文件缺字段 ⇒ 空记录（fail-safe）');
+  assert.equal(legacy.warnedStepByAgent[SESSION], 50, '旧字段照常读出来');
+  assert.equal(legacy.rearmSeqByAgent[SESSION], 22_100, '旧字段照常读出来');
+  assert.equal(lastRemindedBoundarySeq(legacy, SESSION), -1, '空记录 ⇒ -1（下一条边界必须能提醒）');
 });

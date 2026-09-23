@@ -36,6 +36,15 @@ export interface ReminderState {
    * turn/end 都清档 = 梯级永不生效（反向刷屏）。
    */
   readonly rearmSeqByAgent: Record<string, number>
+  /**
+   * 已提醒过的**任务边界** seq（2026-09-23 主人定调「压缩提醒太死板」）。
+   * 语义：数值 ＝ 已提醒过的最近一次 `goal/change` 边界 seq；`<= 上次记录` ⇒ 不再重复提醒。
+   *
+   * 为什么需要它：跨界残留（边界之前的 token）**不会自己减少**——它会一直留在 surface 里，
+   * 直到某次压缩把它折进摘要。若不去重，每个 `turn/end` 都会命中同一条判据 ⇒ 变成刷屏。
+   * 而「每个边界只提醒一次」必须**落盘**：否则每次重启都会对同一条旧边界再提醒一次（狼来了）。
+   */
+  readonly taskBoundarySeqByAgent: Record<string, number>
 }
 
 /** 空状态（未授权/文件缺失/文件损坏一律回落到它）。 */
@@ -44,6 +53,7 @@ export const EMPTY_REMINDER_STATE: ReminderState = Object.freeze({
   warnedAtByAgent: {},
   warnedStepByAgent: {},
   rearmSeqByAgent: {},
+  taskBoundarySeqByAgent: {},
 })
 
 /** 只保留字符串键 → 有限数字值的记录（其余一律丢弃）。 */
@@ -69,12 +79,14 @@ export function parseReminderState(raw: unknown): ReminderState {
     warnedAtByAgent?: unknown
     warnedStepByAgent?: unknown
     rearmSeqByAgent?: unknown
+    taskBoundarySeqByAgent?: unknown
   }
   return {
     failureSeqByAgent: numberRecord(record.failureSeqByAgent),
     warnedAtByAgent: numberRecord(record.warnedAtByAgent),
     warnedStepByAgent: numberRecord(record.warnedStepByAgent),
     rearmSeqByAgent: numberRecord(record.rearmSeqByAgent),
+    taskBoundarySeqByAgent: numberRecord(record.taskBoundarySeqByAgent),
   }
 }
 
@@ -89,6 +101,7 @@ export function serializeReminderState(state: ReminderState): string {
     warnedAtByAgent: state.warnedAtByAgent,
     warnedStepByAgent: state.warnedStepByAgent,
     rearmSeqByAgent: state.rearmSeqByAgent,
+    taskBoundarySeqByAgent: state.taskBoundarySeqByAgent,
   })
 }
 
@@ -167,6 +180,33 @@ export function withRearmed(state: ReminderState, agentId: string, endSeq: numbe
   const prev = state.rearmSeqByAgent[agentId]
   if (prev !== undefined && prev >= endSeq) return state
   return { ...state, rearmSeqByAgent: { ...state.rearmSeqByAgent, [agentId]: endSeq } }
+}
+
+/**
+ * 记录一次**任务边界提醒**（不可变更新，只升不降）。
+ *
+ * 事件流 seq 单调递增 ⇒ 边界 seq 也只增，「只升不降」即「不因乱序重放而倒退」。
+ *
+ * @param state - 当前状态
+ * @param agentId - 目标 agent
+ * @param boundarySeq - 已提醒的任务边界 seq
+ * @returns 已记过同等或更晚的边界 ⇒ **原对象**（幂等，避免无谓写盘）
+ */
+export function withBoundaryReminded(state: ReminderState, agentId: string, boundarySeq: number): ReminderState {
+  const prev = state.taskBoundarySeqByAgent[agentId]
+  if (prev !== undefined && prev >= boundarySeq) return state
+  return { ...state, taskBoundarySeqByAgent: { ...state.taskBoundarySeqByAgent, [agentId]: boundarySeq } }
+}
+
+/**
+ * 已提醒过的任务边界 seq。
+ *
+ * @param state - 当前状态
+ * @param agentId - 目标 agent
+ * @returns 上次提醒的边界 seq；**从未提醒过 ⇒ `-1`**（任何真实边界 seq 都大于它）
+ */
+export function lastRemindedBoundarySeq(state: ReminderState, agentId: string): number {
+  return state.taskBoundarySeqByAgent[agentId] ?? -1
 }
 
 /**

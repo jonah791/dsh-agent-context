@@ -50,7 +50,23 @@ import {
   shouldRearm,
   withRearmed,
   withoutFailure,
+  withBoundaryReminded,
+  lastRemindedBoundarySeq,
 } from './reminder-state.ts';
+// 2026-09-23 主人定调「压缩提醒太死板」：第三条通道——按**任务边界**提醒（读相关度，不只读占用）
+import {
+  watchTaskBoundary,
+  measureCarryOver,
+  decideTaskBoundaryHint,
+  buildTaskBoundaryHintText,
+  DEFAULT_TASK_LOOKBACK,
+} from './task-boundary.ts';
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-agent-context': { kind: 'dsh-agent-context' }
+  }
+}
 
 export const name = 'agent-context';
 export const inject = ['commands', 'tokenMeter', 'sessionProjections', 'tools', 'agents'];
@@ -66,6 +82,19 @@ export interface Config {
    * 空数组 = 关掉梯级通道，只剩旧通道。默认 [50, 65, 80, 90]。
    */
   warnAtPercents: number[]
+  /**
+   * **任务边界通道**开关（2026-09-23 主人定调）。
+   *
+   * 前两条通道（梯级 / 绝对阈值）都只读**占用**一个维度：1M 窗口下 50% 档恰等于旧通道的
+   * 500000，两条实际重合在 500K，与任务结构无关。本通道补第二个维度——**与当前任务的相关度**
+   * （可计算代理 = 跨界残留比），在 `goal/change` 构成的**任务边界**上提醒，
+   * 于是「上一个任务留下大半噪音、新任务才刚开始」这种最该压的时刻能在 50% 之前被看见。
+   */
+  taskBoundaryHintEnabled: boolean
+  /** 边界提醒的**残留 token 下限**：低于它压了也不省，不值得打扰（默认 30000）。 */
+  taskBoundaryMinTokens: number
+  /** 边界提醒的**残留占比下限**（0–1）：当前任务自己已占多数则不必压（默认 0.5）。 */
+  taskBoundaryMinRatio: number
   /** 2026-08-21 合并：透传给 dsh-agent-context-pruner 的配置（可选覆盖，缺省用其默认值）。 */
   pruner?: Record<string, unknown>
 }
@@ -73,6 +102,9 @@ export const Config = z.object({
   warnThreshold: z.number().default(500000),
   warnCooldownMs: z.number().default(3600000),
   warnAtPercents: z.array(z.number()).default([50, 65, 80, 90]),
+  taskBoundaryHintEnabled: z.boolean().default(true),
+  taskBoundaryMinTokens: z.number().step(1).min(0).default(30000),
+  taskBoundaryMinRatio: z.number().min(0).max(1).default(0.5),
   pruner: z.any().required(false),
 });
 
@@ -208,7 +240,7 @@ export function apply(ctx: Context, config: Config): void {
             agent.send(
               createUserMessage({
                 content: [{ type: 'text', text }],
-                source: { kind: 'plugin', plugin: 'dsh-agent-context' },
+                source: { kind: 'dsh-agent-context' },
               }),
               // next-step（主人 2026-08-25）：提醒插到下一帧之前，而非等到下一回合结束才注入
               'next-step',
@@ -252,25 +284,59 @@ export function apply(ctx: Context, config: Config): void {
         const report = buildReport(ctx.tokenMeter, ctx.sessionProjections, agent.session);
         const tokens = report.projectedTokens ?? report.totalTokens;
 
-        // ── ① 梯级插话（2026-09-22 主人指令）──────────────────────────────
-        // 旧通道是「单一绝对阈值 + 一小时冷却」⇒ 用量爬到 57% 时仍被冷却压住，感知到不了我这里，
-        // 只能等主人手动插一句。改为**随用量递进的档位**：每跨一档插一次，每档只插一次。
+        // ── ① 占用维（梯级）+ 相关度维（任务边界）：先各自算判据，再合成**一条**插话 ──────
+        // 2026-09-23 主人定调「压缩提醒太死板」：梯级与绝对阈值都只读**占用**——1M 窗口下
+        // 50% 档恰等于旧通道的 500000，两条实际重合在 500K，与任务结构无关。第三条通道读
+        // **任务边界**（`goal/change` 的 create/complete/clear）与**跨界残留比**，于是
+        // 「上一个任务留下大半噪音、新任务才刚开始」这种最该压的时刻能在 50% 之前被看见。
         const step = nextWarnStep(
           config.warnAtPercents,
           tokens,
           report.contextWindow,
           reminderState.warnedStepByAgent[agent.id] ?? 0,
         );
-        if (step !== null) {
+        // 相关度维：开关关闭时**不读事件流、不量残留**（零额外开销）
+        const measurement = config.taskBoundaryHintEnabled ? ctx.tokenMeter.measure(agent.session) : null;
+        const boundary = measurement === null
+          ? null
+          : watchTaskBoundary(readEvent, agent.session.seq, DEFAULT_TASK_LOOKBACK);
+        const carryOver = boundary === null || measurement === null
+          ? { tokens: 0, ratio: 0 }
+          : measureCarryOver(measurement.nodes, boundary.seq, measurement.surfaceTokens);
+        const boundaryHit = measurement === null
+          ? null
+          : decideTaskBoundaryHint({
+            boundary,
+            carryOver,
+            lastRemindedSeq: lastRemindedBoundarySeq(reminderState, agent.id),
+            minTokens: config.taskBoundaryMinTokens,
+            minRatio: config.taskBoundaryMinRatio,
+          });
+
+        if (step !== null || boundaryHit !== null) {
           const now = Date.now();
-          // 先落盘再投递（同「先落盘」纪律）：投递失败也不会重复轰炸
-          reminderState = withWarnedStep(reminderState, agent.id, step.step);
+          // 先落盘再投递（同「先落盘」纪律）：投递失败也不会重复轰炸。
+          // **两条通道各自推进自己的去重键**——否则被合成消息盖住的那条会在下一轮补报（双重打扰）。
+          if (step !== null) reminderState = withWarnedStep(reminderState, agent.id, step.step);
+          if (boundaryHit !== null) reminderState = withBoundaryReminded(reminderState, agent.id, boundaryHit.seq);
           reminderState = withWarned(reminderState, agent.id, now);
           persistReminderState();
-          const win = report.contextWindow ?? 0;
-          interject('【上下文提醒】上下文已用 **' + step.percent + '%**（约 '
-            + (tokens / 1000).toFixed(0) + 'K / ' + (win / 1000).toFixed(0) + 'K）'
-            + '——已跨过 ' + step.step + '% 档。建议压缩（/compact）或剪枝后再继续，避免超限中断。');
+          const parts: string[] = [];
+          if (step !== null) {
+            const win = report.contextWindow ?? 0;
+            parts.push('【上下文提醒】上下文已用 **' + step.percent + '%**（约 '
+              + (tokens / 1000).toFixed(0) + 'K / ' + (win / 1000).toFixed(0) + 'K）'
+              + '——已跨过 ' + step.step + '% 档。建议压缩（/compact）或剪枝后再继续，避免超限中断。');
+          }
+          if (boundaryHit !== null) {
+            parts.push(buildTaskBoundaryHintText({
+              boundary: boundaryHit,
+              carryOver,
+              usedTokens: tokens,
+              contextWindow: report.contextWindow,
+            }));
+          }
+          interject(parts.join('\n'));
           return;
         }
 
@@ -338,7 +404,7 @@ export function apply(ctx: Context, config: Config): void {
             agent.send(
               createUserMessage({
                 content: [{ type: 'text', text }],
-                source: { kind: 'plugin', plugin: 'dsh-agent-context' },
+                source: { kind: 'dsh-agent-context' },
               }),
               'next-step',
               true,
