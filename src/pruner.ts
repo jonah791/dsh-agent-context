@@ -26,6 +26,7 @@ import { freezeMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
 import { inspectContent, planLevels, suggestLevel, PRUNE_LEVELS } from './prune-plan.ts'
 import type { ContentFlags, LevelPlan, PruneLevel } from './prune-plan.ts'
+import { sharedPrefixLength } from './prefix-scan.ts'
 
 export const prunerName = 'agent-context-pruner'
 export const prunerInject = ['tools', 'tokenMeter'] as const
@@ -139,6 +140,20 @@ interface TurnUsage {
   outputTokens: number
   /** 缓存命中率 = cacheRead / (input + cacheRead + cacheWrite)；无输入时为 null。 */
   hitRate: number | null
+  /**
+   * 前缀分叉探测（2026-10-11 新增）：本次表层节点序列与上一次的**共同前缀节点数**。
+   * 借鉴 Headroom 的 CacheAligner 问题意识（谁打爆了 KV-cache 前缀），但用**实测对比**而非启发式标记。
+   * 判据（⚠ 两处措辞陷阱见 prefix-scan.ts 头注释）：
+   * `prefixSharedNodes === prevSurfaceNodes` ⇒ 旧表层**原样保留**（只是尾部追加）；
+   * 小于 ⇒ 旧表层有节点未被保留（被替换 / 被移除），共同前缀止于该点。
+   * **命中只到 `prefixSharedNodes` 为止**——其后部分本就不在缓存里，故不要把「小于」读成故障；
+   * 要连 `surfaceNodes` 一起读：`shared / surfaceNodes` ≈ 本轮可命中的占比（节点数近似 token 数）。
+   */
+  prefixSharedNodes: number | null
+  /** 对比基准：上一次记录时的表层节点数（首次记录为 null）。 */
+  prevSurfaceNodes: number | null
+  /** 本次表层节点数。 */
+  surfaceNodes: number | null
   at: string
 }
 
@@ -159,10 +174,12 @@ interface PruneStats {
   turns: Map<number, Map<number, TurnUsage>>
   /** 剪枝事件时间线（与命中率曲线对齐）。 */
   pruneEvents: PruneEvent[]
+  /** 上一次记录时的表层节点序列——前缀分叉探测的对比基准（进程内，重启清零）。 */
+  lastSurfaceNodes: readonly number[] | null
 }
 
 function emptyStats(): PruneStats {
-  return { count: 0, charsRemoved: 0, tokensRemoved: 0, lastAt: '', turns: new Map(), pruneEvents: [] }
+  return { count: 0, charsRemoved: 0, tokensRemoved: 0, lastAt: '', turns: new Map(), pruneEvents: [], lastSurfaceNodes: null }
 }
 
 export function applyPruner(ctx: Context, config: Config): void {
@@ -460,6 +477,9 @@ export function applyPruner(ctx: Context, config: Config): void {
         lastAt: now,
         turns: prev.turns,
         pruneEvents: prev.pruneEvents,
+        // 刻意**不更新基准**：剪枝会替换表层节点，保留旧基准才能让下一次请求时的
+        // 前缀分叉探测如实报出「这次分叉是剪枝造成的」（而不是被就地抹平）。
+        lastSurfaceNodes: prev.lastSurfaceNodes,
       }
       statsBySession.set(session.id, stats)
       // 返回给模型的 stats 必须为纯 JSON（turns 是 Map，仅内部使用）
@@ -606,6 +626,9 @@ export function applyPruner(ctx: Context, config: Config): void {
                 cacheWriteTokens: { type: 'number', required: true },
                 outputTokens: { type: 'number', required: true },
                 hitRate: { type: 'number' },
+                prefixSharedNodes: { type: 'number' },
+                prevSurfaceNodes: { type: 'number' },
+                surfaceNodes: { type: 'number' },
                 at: { type: 'string', required: true },
               },
             },
@@ -643,14 +666,27 @@ export function applyPruner(ctx: Context, config: Config): void {
             cacheReadTokens: u.cacheReadTokens,
             cacheWriteTokens: u.cacheWriteTokens,
             outputTokens: u.outputTokens,
-            hitRate: u.hitRate ?? undefined,
+            // ⚠ 工具输出必须是 lossless JSON：**值为 undefined 的键**会被宿主校验拒绝
+            //（walkJsonValue 遍历对象属性遇到 undefined 直接判失败，整条输出作废）。
+            // 故可空字段一律**条件展开**——宁可缺键，不可有 undefined 值（2026-10-11 实测踩到）。
+            ...(u.hitRate === null ? {} : { hitRate: u.hitRate }),
+            ...(u.prefixSharedNodes === null ? {} : { prefixSharedNodes: u.prefixSharedNodes }),
+            ...(u.prevSurfaceNodes === null ? {} : { prevSurfaceNodes: u.prevSurfaceNodes }),
+            ...(u.surfaceNodes === null ? {} : { surfaceNodes: u.surfaceNodes }),
             at: u.at,
           })))
       return {
         stats: { count: base.count, charsRemoved: base.charsRemoved, tokensRemoved: base.tokensRemoved, lastAt: base.lastAt },
         cacheTurns,
         pruneEvents: base.pruneEvents.map((p) => ({ at: p.at, seqs: p.seqs, charsRemoved: p.charsRemoved })),
-        note: '命中率 = cacheRead/(input+cacheRead+cacheWrite)，provider 实测；剪枝事件与命中率曲线对齐可观察缓存影响；进程内累计（重启清零）',
+        note:
+          '命中率 = cacheRead/(input+cacheRead+cacheWrite)，provider 实测。'
+          + '前缀分叉探测（2026-10-11）：prefixSharedNodes = 本次表层节点序列与上一次的**共同前缀节点数**，'
+          + 'prevSurfaceNodes = 上一次的节点数 ⇒ 两者**相等 = 旧表层原样保留**（只是尾部追加）；'
+          + '**小于 = 旧表层有节点未被保留**（被替换 / 被移除），共同前缀止于该点。'
+          + '读法：命中只能到 prefixSharedNodes 为止，故 shared/surfaceNodes ≈ 本轮可命中的占比；'
+          + '与同轮 hitRate 并排读，「缓存没命中」就从猜测变成归因。'
+          + '进程内累计（重启清零）。',
       }
     },
   })
@@ -715,6 +751,12 @@ export function applyPruner(ctx: Context, config: Config): void {
     const total = input + cacheRead + cacheWrite
     const hitRate = total > 0 ? cacheRead / total : null
     const stats = statsBySession.get(session.id) ?? emptyStats()
+    // 前缀分叉探测（2026-10-11）：取当前表层节点序列，与上次基准比共同前缀。
+    // 只比**节点 seq 序列**——剪枝 / 压缩会 append 新事件并以 surfaceOp 替换旧 seq，
+    // 所以「历史被改写」在这条序列上表现为前缀断裂；正常追加只延长尾部、前缀不动。
+    const surfaceNodes = [...((session as unknown as { surface?: { nodes?: readonly number[] } }).surface?.nodes ?? [])]
+    const prevSurfaceNodes = stats.lastSurfaceNodes
+    const prefixSharedNodes = prevSurfaceNodes === null ? null : sharedPrefixLength(prevSurfaceNodes, surfaceNodes)
     let steps = stats.turns.get(turn)
     if (steps === undefined) {
       steps = new Map()
@@ -728,8 +770,12 @@ export function applyPruner(ctx: Context, config: Config): void {
       cacheWriteTokens: cacheWrite,
       outputTokens: output,
       hitRate,
+      prefixSharedNodes,
+      prevSurfaceNodes: prevSurfaceNodes === null ? null : prevSurfaceNodes.length,
+      surfaceNodes: surfaceNodes.length,
       at: new Date().toISOString(),
     })
+    stats.lastSurfaceNodes = surfaceNodes
     statsBySession.set(session.id, stats)
   })
 
