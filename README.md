@@ -14,7 +14,7 @@
   <a href="https://github.com/jonah791/dsh-agent-context"><img src="https://img.shields.io/badge/version-0.2.3-blue" alt="version"></a>
   <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
-  <img src="https://img.shields.io/badge/tests-20%20passed-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-75%20passed-brightgreen" alt="tests">
 </p>
 
 **一句话**：一个「上下文仪表盘」加一套「剪枝工具」，外挂两条「提醒通道」——`/context` 报告 + `ctx.contextMeter` 服务给出现占用，5 个工具负责把上下文剪瘦，`:turn/end` 上的两个监听器在占用越阈值、或上一次压缩失败时，主动往会话里投一条提醒。
