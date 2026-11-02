@@ -52,6 +52,7 @@ import {
   withoutFailure,
   withBoundaryReminded,
   lastRemindedBoundarySeq,
+  reminderCheckpoint,
 } from './reminder-state.ts';
 // 2026-09-23 主人定调「压缩提醒太死板」：第三条通道——按**任务边界**提醒（读相关度，不只读占用）
 import {
@@ -79,7 +80,12 @@ export interface Config {
   /**
    * **梯级插话**的档位（百分比，升序）。2026-09-22 主人指令：「上下文感知要走插话形式」。
    * 拿得到 `contextWindow` 时按它递进：每跨过一档插一次话，**每档只插一次**（持久化去重）。
-   * 空数组 = 关掉梯级通道，只剩旧通道。默认 [50, 65, 80, 90]。
+   * 空数组 = 关掉梯级通道，只剩旧通道。
+   *
+   * 默认 **[40, 50, 65, 80, 90]**（2026-10-18 补 40 档）：原默认从 50 起跳，而
+   * `warnThreshold` 默认 400000 在 1M 窗口下恰是 40% ⇒ **40%~50% 之间存在无档位的
+   * 空白带**，那一段里绝对阈值又被 `warnCooldownMs` 压着 ⇒ 主人连问三次「怎么没来」。
+   * 档位必须覆盖绝对阈值所在的位置，否则两条通道会一起静音。
    */
   warnAtPercents: number[]
   /**
@@ -101,7 +107,7 @@ export interface Config {
 export const Config = z.object({
   warnThreshold: z.number().default(500000),
   warnCooldownMs: z.number().default(3600000),
-  warnAtPercents: z.array(z.number()).default([50, 65, 80, 90]),
+  warnAtPercents: z.array(z.number()).default([40, 50, 65, 80, 90]),
   taskBoundaryHintEnabled: z.boolean().default(true),
   taskBoundaryMinTokens: z.number().step(1).min(0).default(30000),
   taskBoundaryMinRatio: z.number().min(0).max(1).default(0.5),
@@ -229,9 +235,16 @@ export function apply(ctx: Context, config: Config): void {
     // 故用 setImmediate 延迟到 append 事务完成后投递（对齐 skill-forge 同款修复）。
     ctx.on('session/event', (session: { id: string }, event: unknown) => {
       const ev = event as { type?: string }
-      if (ev.type !== 'turn/end') return
+      // 2026-10-15 主人指令：「不能是下一轮，而是**下一个工具调用**」——判定点从
+      // turn/end 细化到 **step/end**（官方口径的真实工作单元：一次完整思考 +
+      // 工具调用链，一轮可含多步）。在 step/end 判定 ⇒ 由 next-step 投递的插话
+      // 恰好落在**下一个工具调用之前**，而不是等到下一轮。
+      // turn/end 保留为兜底（纯文本轮无 step 时仍会检查一次）。
+      const checkpoint = reminderCheckpoint(ev.type)
+      if (checkpoint === null) return
+      const isTurnEnd = checkpoint === 'turn'
       const agent = ctx.agents?.get(session.id as never)
-      if (agent === undefined) return // agent 未找到：跳过（不阻塞，下轮重试）
+      if (agent === undefined) return // agent 未找到：跳过（不阻塞，下步重试）
       /** 插话的**唯一投递口**：两条通道共用它，保证「形式」永远一致（主人 2026-09-22：「要走插话形式」）。 */
       const interject = (text: string): void => {
         // reenter 修复：延迟到当前 session.append 事务完成后投递
@@ -296,7 +309,9 @@ export function apply(ctx: Context, config: Config): void {
           reminderState.warnedStepByAgent[agent.id] ?? 0,
         );
         // 相关度维：开关关闭时**不读事件流、不量残留**（零额外开销）
-        const measurement = config.taskBoundaryHintEnabled ? ctx.tokenMeter.measure(agent.session) : null;
+        // 任务边界维是**轮级**语义（读 goal/change 事件流 + 量跨界残留，比占用维贵），
+        // 只在 turn/end 跑；step 级只跑占用维（梯级 + 绝对阈值），避免每步遍历会话。
+        const measurement = (isTurnEnd && config.taskBoundaryHintEnabled) ? ctx.tokenMeter.measure(agent.session) : null;
         const boundary = measurement === null
           ? null
           : watchTaskBoundary(readEvent, agent.session.seq, DEFAULT_TASK_LOOKBACK);

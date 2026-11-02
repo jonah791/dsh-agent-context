@@ -136,6 +136,21 @@ export function nextWarnStep(
   return { step: hit, percent: Math.round(ratio * 100) }
 }
 
+/**
+ * 判定点类型：`turn/end`（轮末兜底）或 `step/end`（2026-10-15 主人指令：
+ * 「不能是下一轮，而是**下一个工具调用**」——step 是官方口径的真实工作单元
+ * （一次完整思考 + 工具调用链，一轮可含多步），在 step/end 判定 ⇒ 由
+ * next-step 投递的插话落在**下一个工具调用之前**，而不是等到下一轮）。
+ *
+ * @param eventType - 会话事件类型
+ * @returns 判定点类型；不是判定点 ⇒ `null`
+ */
+export function reminderCheckpoint(eventType: string | undefined): 'turn' | 'step' | null {
+  if (eventType === 'turn/end') return 'turn'
+  if (eventType === 'step/end') return 'step'
+  return null
+}
+
 /** 记录一次梯级插话（不可变更新，只升不降）。 */
 export function withWarnedStep(state: ReminderState, agentId: string, step: number): ReminderState {
   const prev = state.warnedStepByAgent[agentId] ?? 0
