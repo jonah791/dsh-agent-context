@@ -365,6 +365,7 @@ export function applyPruner(ctx: Context, config: Config): void {
 
   const pruneApplyTool: ToolDefinition = defineTool({
     name: 'prune_apply',
+    deferLoading: true,
     description: '执行上下文剪枝（可写）：按候选 seq 剪指定 tool/result 节点——头+标记+尾保留，replay-safe（仅追加日志保留完整原始事件，可回放恢复；每次替换前写 compaction/prune 定价事件）。**2026-09-20 新增 level 档位**（移植自 fast-jev-compaction 的渐进降级）：L1=头 4096+尾 1024（缺省，与旧行为一致）/ L2=头 1024+尾 256 / L3=只留一行注记（适合可重取的同质大块，剪得最狠）。不在表层/非 tool/result/预算内节点自动跳过，幂等。剪枝前请先跑 prune_candidates 看 suggest 与 levels，并确认判断纪律。',
     parameters: {
       seqs: { type: 'array', items: { type: 'number' }, description: '要剪的候选 seq 列表（来自 prune_candidates）' },
@@ -495,6 +496,7 @@ export function applyPruner(ctx: Context, config: Config): void {
 
   const expandTool: ToolDefinition = defineTool({
     name: 'expand',
+    deferLoading: true,
     description: '恢复被入口守卫折叠的工具结果为全量（可写）：按 callId 豁免折叠，下一轮请求起该结果以全文进上下文（原文一直在会话日志中）。callId 从折叠标记或工具调用记录获取。',
     parameters: {
       callId: { type: 'string', required: true, description: '工具调用 id（折叠标记中可见）' },
@@ -556,6 +558,7 @@ export function applyPruner(ctx: Context, config: Config): void {
 
   const guardTool: ToolDefinition = defineTool({
     name: 'prune_guard',
+    deferLoading: true,
     description: '入口守卫状态（可写/只读）：大工具结果在进入上下文前被折叠为「头+尾+折叠标记」（源头控制，避免先全量 prefill 再剪）。mode=on/off 切换；缺省只读查看。',
     parameters: {
       mode: { type: 'string', enum: ['on', 'off'], description: '切换守卫开关（缺省只读查看）' },
